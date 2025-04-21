@@ -1,0 +1,240 @@
+[33mcommit af751581dac9d3d086d17eaf7a5da7d5f9b90e1e[m[33m ([m[1;36mHEAD -> [m[1;32mmain[m[33m)[m
+Author: GuoAnn <2250057441@qq.com>
+Date:   Tue Mar 4 10:50:46 2025 +0800
+
+    add gt_pose mode and tracking function
+
+[33mcommit 47ea4af9bcb4fe8869e49f8339709c54221febcc[m[33m ([m[1;31morigin/main[m[33m, [m[1;31morigin/HEAD[m[33m)[m
+Author: GuoAnn <2250057441@qq.com>
+Date:   Thu Feb 27 11:45:43 2025 +0800
+
+    Update dataset.py with exr reading
+
+[33mcommit c2970e369513a3bae7cc75bf051c2c2922dbd990[m
+Author: GuoAnn <2250057441@qq.com>
+Date:   Thu Feb 20 21:37:14 2025 +0800
+
+    edit eval_utils show render result in eval
+
+[33mcommit 069ce9a63bbced767d51a720088d61532f258313[m
+Author: GuoAnn <2250057441@qq.com>
+Date:   Thu Feb 20 10:58:04 2025 +0800
+
+    Update configurations and utility scripts
+
+[33mcommit 6c9254c319d8bff5caeef65259e6bb0941a9b9f6[m
+Author: hide@dyson <muskie0802@gmail.com>
+Date:   Mon May 13 06:43:56 2024 +0100
+
+    readme
+
+[33mcommit 60be4939b007e7aafc53f37aa0076659d39ca4b1[m
+Merge: b9f8b66 72d7366
+Author: Hide Matsuki <muskie0802@gmail.com>
+Date:   Fri May 10 05:17:50 2024 +0100
+
+    Merge pull request #64 from rohitmenon86/main
+    
+    Feature: Add capability for realsense to use depth stream as well
+
+[33mcommit 72d73666f93c0649eef1e576d085d987268eeb50[m
+Author: Rohit Menon <rohit.menon@uni-bonn.de>
+Date:   Mon May 6 15:12:48 2024 +0200
+
+    removed print functions
+
+[33mcommit 93a9acc64a94eb3347e44600dbb09c50b7908ae6[m
+Merge: 5ed027d d93812e
+Author: Rohit Menon <rohit.menon@uni-bonn.de>
+Date:   Mon May 6 15:02:51 2024 +0200
+
+    Merge branch 'main' of github.com:rohitmenon86/MonoGS into devel
+
+[33mcommit 5ed027d6659197b2581a1ca2c39d3b81d8cbf592[m
+Author: Rohit Menon <rohit.menon@uni-bonn.de>
+Date:   Mon May 6 14:56:47 2024 +0200
+
+    changed default width and height to 720 and 1280. However, not tested on my system as my GPU cannot handle
+
+[33mcommit 6c8452369e5c9969708d0f1be64337dd3e451783[m
+Author: Rohit Menon <rohit.menon@uni-bonn.de>
+Date:   Mon May 6 14:54:14 2024 +0200
+
+    PR Changes from reviewer implemented
+
+[33mcommit 3e6e16265141ad455f90cbba9ec9cfeade517360[m
+Author: Rohit Menon <rohit.menon@uni-bonn.de>
+Date:   Wed Apr 10 18:21:30 2024 +0200
+
+    save_results
+
+[33mcommit e56c34ed323ebd3c9ef88020adfb806bbc0f06fe[m
+Author: Rohit Menon <rohit.menon@uni-bonn.de>
+Date:   Wed Apr 10 17:02:09 2024 +0200
+
+    Prevent flooding of print
+
+[33mcommit 5b5045915ab804d7adef30ea7bc7dfafa3a7d189[m
+Author: Rohit Menon <rohit.menon@uni-bonn.de>
+Date:   Wed Apr 10 16:59:18 2024 +0200
+
+    change sensor_type config for realsense to depth
+
+[33mcommit cce05d959564c5f5a0988d7fd5e2e99731c78bc8[m
+Author: Rohit Menon <rohit.menon@uni-bonn.de>
+Date:   Wed Apr 10 16:58:52 2024 +0200
+
+    Print Live and Avg FPS
+
+[33mcommit 1c10db9c1d45711ec03eb4f297310f43a13d33bc[m
+Author: Rohit Menon <rohit.menon@uni-bonn.de>
+Date:   Wed Apr 10 16:58:21 2024 +0200
+
+    Get depth frame
+
+[33mcommit 46ec408df8e7eb09a578359af96669f934dc0545[m
+Author: Rohit Menon <rohit.menon@uni-bonn.de>
+Date:   Wed Apr 10 16:57:17 2024 +0200
+
+    Initialize depth stream
+
+[33mcommit d93812e49c326de32c1d0c0bd4e7c65cdb5df364[m
+Author: Rohit Menon <rohit.menon@uni-bonn.de>
+Date:   Mon May 6 14:56:47 2024 +0200
+
+    changed default width and height to 720 and 1280. However, not tested on my system as my GPU cannot handle
+
+[33mcommit c0f8e07c84bbd1018398545e8635973ebd542e87[m
+Author: Rohit Menon <rohit.menon@uni-bonn.de>
+Date:   Mon May 6 14:54:14 2024 +0200
+
+    PR Changes from reviewer implemented
+
+[33mcommit b9f8b66b39e66fe74cfe3ebd4d3137fe8492ea4b[m
+Author: hide@dyson <muskie0802@gmail.com>
+Date:   Thu May 2 12:35:04 2024 +0100
+
+    Typo fix: LICENCE.md
+
+[33mcommit abb92134f927ef01ce627009f07dee276af61ec9[m
+Merge: a4b2811 86ec465
+Author: Hide Matsuki <muskie0802@gmail.com>
+Date:   Sun Apr 28 17:15:13 2024 +0100
+
+    Merge pull request #78 from DapengFeng/main
+    
+    Fix GPU Memory Leak in Ellipsoid Shader
+
+[33mcommit a4b28115c33bd2711b1e145b8912f009c16415c8[m
+Merge: fd5c6a7 520c7fa
+Author: Riku Murai <rmurai0610@gmail.com>
+Date:   Sun Apr 28 15:21:52 2024 +0100
+
+    Merge pull request #79 from Muhammad0312/patch-1
+    
+    Update eval_utils.py
+
+[33mcommit 520c7fa639aec1ede3a22c0d598e6f5fe7dc4e1e[m
+Author: Muhammad Awais <55378636+Muhammad0312@users.noreply.github.com>
+Date:   Wed Apr 24 14:46:14 2024 +0200
+
+    Update eval_utils.py
+    
+    fixed a typo
+
+[33mcommit 86ec465a3f8871c7adab832a66bd7d340c2ef5ad[m
+Author: DapengFeng <18318646+DapengFeng@users.noreply.github.com>
+Date:   Wed Apr 24 09:47:35 2024 +0800
+
+    Update util.py
+    
+    Return buffer_id
+
+[33mcommit 2217a77b1a789d1de659e0e19856ca6467fe6b9a[m
+Author: DapengFeng <18318646+DapengFeng@users.noreply.github.com>
+Date:   Wed Apr 24 09:46:49 2024 +0800
+
+    Update render_ogl.py
+    
+    Fix GPU Memory Leak
+
+[33mcommit fd5c6a76b935a43a14c70fdeb7779f3fa4dc49f3[m
+Author: hide@dyson <muskie0802@gmail.com>
+Date:   Sun Apr 21 23:55:01 2024 +0100
+
+    Minor fix: readme and data loader
+
+[33mcommit 6fb1abf2bd82fa3f047a57aa3672d84ff538058e[m
+Author: Rohit Menon <rohit.menon@uni-bonn.de>
+Date:   Wed Apr 10 18:21:30 2024 +0200
+
+    save_results
+
+[33mcommit 934857994b45966eae7b1516533027287f9a591d[m
+Author: Rohit Menon <rohit.menon@uni-bonn.de>
+Date:   Wed Apr 10 17:02:09 2024 +0200
+
+    Prevent flooding of print
+
+[33mcommit cc82e1801875b33ba058c1bab481f76bab634a90[m
+Author: Rohit Menon <rohit.menon@uni-bonn.de>
+Date:   Wed Apr 10 16:59:18 2024 +0200
+
+    change sensor_type config for realsense to depth
+
+[33mcommit 13a3e97818c521dc4015ec6d35273311fcedc5f4[m
+Author: Rohit Menon <rohit.menon@uni-bonn.de>
+Date:   Wed Apr 10 16:58:52 2024 +0200
+
+    Print Live and Avg FPS
+
+[33mcommit fab2ea5dd162598166f450bf1322756c46911354[m
+Author: Rohit Menon <rohit.menon@uni-bonn.de>
+Date:   Wed Apr 10 16:58:21 2024 +0200
+
+    Get depth frame
+
+[33mcommit 68df719f190117c96df198dd1ae3d54f396f3335[m
+Author: Rohit Menon <rohit.menon@uni-bonn.de>
+Date:   Wed Apr 10 16:57:17 2024 +0200
+
+    Initialize depth stream
+
+[33mcommit 37cebb4b8df24777980eac00276c07059b94762c[m
+Merge: 4bd8b7d 607dfb8
+Author: Hide Matsuki <muskie0802@gmail.com>
+Date:   Fri Mar 8 16:47:13 2024 +0000
+
+    Merge pull request #14 from alik-git/typo-fix
+    
+    there are 2 output dirs, 'result' & 'results', likely typo, use "results" for consistency
+
+[33mcommit 607dfb8f0a6ebfc241f40b371af4c3b26103f6aa[m
+Author: Ali K <alihusein.kuwajerwala@umontreal.ca>
+Date:   Thu Mar 7 17:50:05 2024 -0500
+
+    there are two output folders 'result' and 'results', likely typo, use 'results' for consistency
+
+[33mcommit 4bd8b7d644a163621f127692fce8d8bb4713f73b[m
+Author: Riku Murai <rmurai0610@gmail.com>
+Date:   Wed Mar 6 16:15:12 2024 +0000
+
+    Don't unpause backend when color refinement is done
+
+[33mcommit 7e4917bdb0b8e2faa113f8159da7f41ca5d66a49[m
+Author: Riku Murai <rmurai0610@gmail.com>
+Date:   Wed Mar 6 14:05:24 2024 +0000
+
+    Fix dataset path for rgbd/tum-fr3
+
+[33mcommit 66721d4ecb3406030087eb5d1adf3bd9b9934e20[m
+Author: Riku Murai <rmurai0610@gmail.com>
+Date:   Mon Mar 4 15:46:01 2024 +0000
+
+    Enable wandb in eval mode
+
+[33mcommit 7c4ce90f75f07d7f68ad96c6249141d3636b60ae[m
+Author: hide@dyson <muskie0802@gmail.com>
+Date:   Mon Mar 4 00:51:19 2024 +0000
+
+    first commit

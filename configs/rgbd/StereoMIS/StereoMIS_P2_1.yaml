@@ -1,0 +1,20 @@
+inherit_from: "configs/rgbd/StereoMIS/base_config.yaml"
+
+Dataset:
+  dataset_path: "/root/GS_datasets/datasets/StereoMIS/"
+  Calibration:
+    fx: 516.9471435
+    fy: 516.8573608
+    cx: 302.289287
+    cy: 257.488098
+    k1: 0 #？
+    k2: 0 #？
+    p1: 0 #？
+    p2: 0 #？
+    k3: 0 #？
+    width: 640
+    height: 512
+    depth_scale: 100 #5000.0
+    distorted: False
+
+
