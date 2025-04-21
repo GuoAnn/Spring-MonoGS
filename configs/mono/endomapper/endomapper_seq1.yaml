@@ -1,4 +1,4 @@
-inherit_from: "configs/rgbd/endomapper/base_config.yaml"
+inherit_from: "configs/mono/endomapper/base_config.yaml"
 
 Dataset:
   dataset_path: "/root/GS_datasets/datasets/endomapper/endomapper_seq1/"

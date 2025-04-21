@@ -14,6 +14,7 @@ from utils.multiprocessing_utils import clone_obj
 from utils.pose_utils import update_pose
 from utils.slam_utils import get_loss_mapping
 from pytorch3d.ops import knn_points
+from utils.slam_frontend import AnchorManager
 
 class BackEnd(mp.Process):
     def __init__(self, config):

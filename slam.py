@@ -58,7 +58,7 @@ class SLAM:
             raise ValueError("模型参数缺少sh_degree定义")
 
         # 强制指定设备到cuda:0
-        self.gaussians = GaussianModel(model_params.sh_degree, config=self.config).to("cuda:0")
+        self.gaussians = GaussianModel(model_params.sh_degree, config=self.config)#.to("cuda:0")
         self.gaussians.init_lr(6.0)
         try:
             self.dataset = load_dataset(model_params, model_params.source_path, config=config)

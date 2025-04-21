@@ -720,6 +720,7 @@ class Renderer:
             self.spring_visual.set_data(
                 pos=line_pos,
                 color=(1,0,0,1)  # 红色半透明
+            )
             self.spring_visible = True
         else:
             self.spring_visible = False

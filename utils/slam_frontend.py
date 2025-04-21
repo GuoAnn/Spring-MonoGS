@@ -527,7 +527,6 @@ class FrontEnd(mp.Process):
 
             if self.frontend_queue.empty():
                 tic.record()
-                self.q_main2vis.put(gui_utils.GaussianPacket(...))
                 self.push_to_gui()  # 添加可视化调用
                 if cur_frame_idx >= len(self.dataset):
                     if self.save_results:

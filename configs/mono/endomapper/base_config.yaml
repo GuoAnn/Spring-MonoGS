@@ -1,18 +1,18 @@
 ## SLAM parameters
-inherit_from: null  # 明确声明无继承
+inherit_from: null  # 明确声明无继承 
 Results:
   save_results: True
   save_dir: "results"
   save_trj: True
-  save_trj_kf_intv: 5
-  use_gui: False #True
+  save_trj_kf_intv: 10
+  use_gui: True
   eval_rendering: False
   use_wandb: False
 
 Dataset:
   type: 'tum' #tum
-  sensor_type: 'depth'
-  pcd_downsample: 128
+  sensor_type: 'monocular'
+  pcd_downsample: 64
   pcd_downsample_init: 32
   adaptive_pointsize: True
   point_size: 0.01
@@ -36,7 +36,7 @@ Training:
   init_gaussian_th: 0.005
   init_gaussian_extent: 30
   # Tracking and Mapping
-  tracking_itr_num: 200 #100
+  tracking_itr_num: 100
   mapping_itr_num: 150
   gaussian_update_every: 150
   gaussian_update_offset: 50
@@ -49,7 +49,7 @@ Training:
   pose_window: 3
   edge_threshold: 1.1
   rgb_boundary_threshold: 0.01
-  alpha: 0.9
+
   kf_translation: 0.08
   kf_min_translation: 0.05
   kf_overlap: 0.9
@@ -58,8 +58,8 @@ Training:
   single_thread: False
   spherical_harmonics: False
   lr:
-    cam_rot_delta: 0.0003 #0.003
-    cam_trans_delta: 0.0001 #0.001
+    cam_rot_delta: 0.003 #0.003
+    cam_trans_delta: 0.001 #0.001
   # Spring-Mass parameters
   Spring_Mass:
     init_stiffness: 1.0 # 初始刚度系数
@@ -99,7 +99,7 @@ Training:
 ## 3DGS default parameters
 opt_params:
   iterations: 30000
-  position_lr_init: 0.00016
+  position_lr_init: 0.0016
   position_lr_final: 0.0000016
   position_lr_delay_mult: 0.01
   position_lr_max_steps: 30000

@@ -309,9 +309,9 @@ class GaussianModel:
             },
         ]
         # ===== 新增形变参数组 =====
-        param_groups.append({
+        l.append({
             'params': [self._deformation],
-            'lr': self.deformation_lr * opt_params.position_lr_init,
+            'lr': self.deformation_lr * training_args.position_lr_init,
             "name": "deformation"
         })
 
