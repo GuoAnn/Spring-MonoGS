@@ -79,7 +79,7 @@ class SLAM:
         self.config["Results"]["save_dir"] = save_dir
         self.config["Training"]["monocular"] = self.monocular
 
-        self.frontend = FrontEnd(self.config)
+        self.frontend = FrontEnd(self.config, spring_visualize=True)
         self.backend = BackEnd(self.config)
 
         self.frontend.dataset = self.dataset
