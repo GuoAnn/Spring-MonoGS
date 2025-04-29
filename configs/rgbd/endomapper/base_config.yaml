@@ -48,8 +48,17 @@ Training:
   lr:
     cam_rot_delta: 0.0003 #0.003
     cam_trans_delta: 0.0001 #0.001
-
-
+  
+  # Spring Model Parameters
+  spring_model:
+    enabled: True
+    n_anchors: 1000  # 每个关键帧的锚点数量
+    k_neighbors: 8   # 弹簧连接的近邻点数量
+    spring_k: 0.1    # 弹性系数
+    damping: 0.01    # 阻尼系数
+    dt: 0.01         # 时间步长
+    n_iterations: 10 # 优化迭代次数
+    visualize: True  # 是否可视化锚点和弹簧连接
 
 ## 3DGS default parameters
 opt_params:

@@ -173,11 +173,3 @@ class ParamsGUI:
         self.gaussians = gaussians
         self.q_main2vis = q_main2vis
         self.q_vis2main = q_vis2main
-
-# ================ 新增GUI数据结构 ================
-# 在gui_utils.py中添加：
-class SpringPacket:
-    def __init__(self, anchors, connections):
-        self.type = "spring"
-        self.anchors = anchors  # [N,3]
-        self.connections = connections  # [N,K]

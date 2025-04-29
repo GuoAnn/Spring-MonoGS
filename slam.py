@@ -31,44 +31,41 @@ class SLAM:
 
         self.config = config
         self.save_dir = save_dir
-        
-        # 新增配置验证
-        assert "Spring" in config, "配置文件中缺少Spring块"
-        assert "Spring_Mass" in config["Training"], "Training块中缺少Spring_Mass参数"
-
-        model_params = munchify(config.get("model_params", {}))
-        opt_params = munchify(config.get("opt_params", {}))
-        pipeline_params = munchify(config.get("pipeline_params", {}))
+        model_params = munchify(config["model_params"])
+        opt_params = munchify(config["opt_params"])
+        pipeline_params = munchify(config["pipeline_params"])
         self.model_params, self.opt_params, self.pipeline_params = (
             model_params,
             opt_params,
             pipeline_params,
         )
 
-        self.live_mode = self.config["Dataset"].get("type") == "realsense"
-        self.monocular = self.config["Dataset"].get("sensor_type") == "monocular"
-        self.use_spherical_harmonics = self.config["Training"].get("spherical_harmonics", False)
-        self.use_gui = self.config["Results"].get("use_gui", False)
+        self.live_mode = self.config["Dataset"]["type"] == "realsense"
+        self.monocular = self.config["Dataset"]["sensor_type"] == "monocular"
+        self.use_spherical_harmonics = self.config["Training"]["spherical_harmonics"]
+        self.use_gui = self.config["Results"]["use_gui"]
         if self.live_mode:
             self.use_gui = True
-        self.eval_rendering = self.config["Results"].get("eval_rendering", False)
+        self.eval_rendering = self.config["Results"]["eval_rendering"]
+        
+        # 添加弹簧模型相关配置
+        self.spring_model_enabled = self.config["Training"]["spring_model"]["enabled"]
+        if self.spring_model_enabled:
+            Log("Spring model is enabled")
+            Log(f"Number of anchors per keyframe: {self.config['Training']['spring_model']['n_anchors']}")
+            Log(f"Number of spring neighbors: {self.config['Training']['spring_model']['k_neighbors']}")
 
         model_params.sh_degree = 3 if self.use_spherical_harmonics else 0
-        if not hasattr(model_params, 'sh_degree'):
-            raise ValueError("模型参数缺少sh_degree定义")
 
-        # 强制指定设备到cuda:0
-        self.gaussians = GaussianModel(model_params.sh_degree, config=self.config)#.to("cuda:0")
+        self.gaussians = GaussianModel(model_params.sh_degree, config=self.config)
         self.gaussians.init_lr(6.0)
-        try:
-            self.dataset = load_dataset(model_params, model_params.source_path, config=config)
-        except Exception as e:
-            Log(f"数据集加载失败: {str(e)}")
-            raise
+        self.dataset = load_dataset(
+            model_params, model_params.source_path, config=config
+        )
 
         self.gaussians.training_setup(opt_params)
         bg_color = [0, 0, 0]
-        self.background = torch.tensor(bg_color, dtype=torch.float32, device="cuda:0")
+        self.background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
         frontend_queue = mp.Queue()
         backend_queue = mp.Queue()
@@ -79,7 +76,7 @@ class SLAM:
         self.config["Results"]["save_dir"] = save_dir
         self.config["Training"]["monocular"] = self.monocular
 
-        self.frontend = FrontEnd(self.config, spring_visualize=True)
+        self.frontend = FrontEnd(self.config)
         self.backend = BackEnd(self.config)
 
         self.frontend.dataset = self.dataset
@@ -90,6 +87,11 @@ class SLAM:
         self.frontend.q_main2vis = q_main2vis
         self.frontend.q_vis2main = q_vis2main
         self.frontend.set_hyperparams()
+        
+        # 设置弹簧模型参数
+        if self.spring_model_enabled:
+            self.frontend.k_neighbors = self.config["Training"]["spring_model"]["k_neighbors"]
+            self.frontend.n_anchors = self.config["Training"]["spring_model"]["n_anchors"]
 
         self.backend.gaussians = self.gaussians
         self.backend.background = self.background
@@ -100,8 +102,10 @@ class SLAM:
         self.backend.backend_queue = backend_queue
         self.backend.live_mode = self.live_mode
         
-        # 修正Spring_Mass配置路径
-        self.backend.spring_mass_cfg = self.config["Training"]["Spring_Mass"]  # 关键修改点
+        # 设置后端弹簧模型参数
+        if self.spring_model_enabled:
+            self.backend.spring_model_enabled = True
+            self.backend.spring_model_config = self.config["Training"]["spring_model"]
 
         self.backend.set_hyperparams()
 
@@ -112,31 +116,20 @@ class SLAM:
             q_main2vis=q_main2vis,
             q_vis2main=q_vis2main,
         )
-        spring_params={
-                'visualize': self.config["Spring"].get("visualize", False),
-                'k_neighbors': self.config["Spring"].get("k_neighbors", 8)
-            }  # 传递弹簧可视化参数
-        try:
-            backend_process = mp.Process(target=self.backend.run)
-            if self.use_gui:
-                # 传递可视化参数到GUI
-                gui_process = mp.Process(
-                    target=slam_gui.run, 
-                    args=(self.params_gui,),
-                    kwargs={"spring_visualize": self.config["Spring"].get("visualize", False)}
-                )
-                gui_process.start()
-                time.sleep(5)
 
-            backend_process.start()
-            self.frontend.run()
-            backend_queue.put(["pause"])
-        except Exception as e:
-            Log(f"进程启动失败: {str(e)}")
-            raise
+        backend_process = mp.Process(target=self.backend.run)
+        if self.use_gui:
+            gui_process = mp.Process(target=slam_gui.run, args=(self.params_gui,))
+            gui_process.start()
+            time.sleep(5)
+
+        backend_process.start()
+        self.frontend.run()
+        backend_queue.put(["pause"])
 
         end.record()
         torch.cuda.synchronize()
+        # empty the frontend queue
         N_frames = len(self.frontend.cameras)
         FPS = N_frames / (start.elapsed_time(end) * 0.001)
         Log("Total time", start.elapsed_time(end) * 0.001, tag="Eval")
@@ -175,6 +168,7 @@ class SLAM:
                 FPS,
             )
 
+            # re-used the frontend queue to retrive the gaussians from the backend.
             while not frontend_queue.empty():
                 frontend_queue.get()
             backend_queue.put(["color_refinement"])
@@ -209,20 +203,20 @@ class SLAM:
             wandb.log({"Metrics": metrics_table})
             save_gaussians(self.gaussians, self.save_dir, "final_after_opt", final=True)
 
-        try:
-            backend_queue.put(["stop"])
-            if backend_process.is_alive():
-                backend_process.join(timeout=30)
-            if self.use_gui and gui_process.is_alive():
-                q_main2vis.put(gui_utils.GaussianPacket(finish=True))
-                gui_process.join(timeout=30)
-        except Exception as e:
-            Log(f"进程终止异常: {str(e)}")
+        backend_queue.put(["stop"])
+        backend_process.join()
+        Log("Backend stopped and joined the main thread")
+        if self.use_gui:
+            q_main2vis.put(gui_utils.GaussianPacket(finish=True))
+            gui_process.join()
+            Log("GUI Stopped and joined the main thread")
 
     def run(self):
         pass
 
+
 if __name__ == "__main__":
+    # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters")
     parser.add_argument("--config", type=str)
     parser.add_argument("--eval", action="store_true")
@@ -281,4 +275,5 @@ if __name__ == "__main__":
     slam.run()
     wandb.finish()
 
+    # All done
     Log("Done.")

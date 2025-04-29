@@ -1,7 +1,7 @@
 inherit_from: "configs/rgbd/endomapper/base_config.yaml"
 
 Dataset:
-  dataset_path: "/root/GS_datasets/datasets/endomapper/endomapper_seq1/"
+  dataset_path: "/root/MonoGS/datasets/endomapper/endomapper_seq1/"
   Calibration:
     fx: 472.64955100886374 #391.886 第一个点的焦距，后面每一个其实都不一样，并且camera只给了一个值，这里先默认fx fy一样的值
     fy: 472.64955100886374 #391.886
@@ -16,6 +16,17 @@ Dataset:
     height: 720
     depth_scale: 5000.0
     distorted: False
+
+Training:
+  spring_model:
+    enabled: True
+    n_anchors: 2000  # 内窥镜场景需要更多的锚点
+    k_neighbors: 12  # 增加近邻点数量以提高稳定性
+    spring_k: 0.05   # 降低弹性系数以适应软组织变形
+    damping: 0.02    # 增加阻尼以减小振荡
+    dt: 0.005        # 减小时间步长以提高精度
+    n_iterations: 15 # 增加迭代次数以提高优化效果
+    visualize: True
 
 
 

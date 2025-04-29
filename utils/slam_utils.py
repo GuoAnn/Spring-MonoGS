@@ -89,22 +89,13 @@ def get_loss_tracking_rgbd(
 
 
 def get_loss_mapping(config, image, depth, viewpoint, opacity, initialization=False):
-    # 原有损失计算
-    l1_loss = torch.abs(image - viewpoint.original_image).mean()
-    ssim_loss = 1.0 - ssim(image, viewpoint.original_image)
-    loss = (1.0 - config["lambda_dssim"]) * l1_loss + config["lambda_dssim"] * ssim_loss
-
-    # ===== 新增物理约束损失 =====
-    if gaussians is not None and "Spring" in config:
-        # 形变位移的L2正则化（确保梯度回传）
-        deformation = gaussians.deformation  # 从高斯模型获取形变参数
-        spring_loss = torch.mean(deformation.norm(dim=1))  # [N,3] -> [N] -> scalar
-        
-        # 从配置获取损失权重（默认0.2）
-        loss_weight = config["Spring"].get("loss_weight", 0.2)
-        loss += loss_weight * spring_loss
-
-    return loss
+    if initialization:
+        image_ab = image
+    else:
+        image_ab = (torch.exp(viewpoint.exposure_a)) * image + viewpoint.exposure_b
+    if config["Training"]["monocular"]:
+        return get_loss_mapping_rgb(config, image_ab, depth, viewpoint)
+    return get_loss_mapping_rgbd(config, image_ab, depth, viewpoint)
 
 
 def get_loss_mapping_rgb(config, image, depth, viewpoint):
@@ -162,3 +153,29 @@ def get_median_depth(depth, opacity=None, mask=None, return_std=False):
     if return_std:
         return valid_depth.median(), valid_depth.std(), valid
     return valid_depth.median()
+
+
+def compute_spring_energy(anchor_points, spring_model):
+    """计算弹簧系统的总能量"""
+    energy = 0.0
+    for i in range(len(anchor_points)):
+        for j in spring_model.knn_index[i]:
+            delta = anchor_points[i] - anchor_points[j]
+            length = torch.norm(delta)
+            rest_length = spring_model.origin_len[i, j]
+            energy += 0.5 * spring_model.k[i, j] * (length - rest_length) ** 2
+    return energy
+
+
+def compute_spring_gradient(anchor_points, spring_model):
+    """计算弹簧系统的梯度"""
+    gradient = torch.zeros_like(anchor_points)
+    for i in range(len(anchor_points)):
+        for j in spring_model.knn_index[i]:
+            delta = anchor_points[i] - anchor_points[j]
+            length = torch.norm(delta)
+            rest_length = spring_model.origin_len[i, j]
+            force = spring_model.k[i, j] * (length - rest_length) * delta / (length + 1e-6)
+            gradient[i] += force
+            gradient[j] -= force
+    return gradient

@@ -64,36 +64,7 @@ class GaussianModel:
         self.ply_input = None
 
         self.isotropic = False
-         # 新增物理属性
-        self.spring_stiffness = torch.empty(0)  # 弹簧刚度 [N]
-        self.damping_factor = torch.empty(0)    # 阻尼系数 [Ns/m]
-        # 锚点影响权重 [N]
-        self.anchor_weights = torch.empty((0), device="cuda")
-        # 形变位移量 [N,3] 
-        self._deformation = torch.zeros((0, 3), device="cuda")
-        # 形变位移的学习率系数（从配置读取）
-        self.deformation_lr = config["Training"].get("deformation_lr", 0.001)
-        # 标记需要优化的物理参数
-        self.physical_params = ['_deformation']
 
-        # ===== 新增属性访问方法 =====
-    @property
-    def deformation(self):
-        """确保外部访问时梯度可追踪"""
-        return self._deformation.clone().detach().requires_grad_(True)
-    
-    @deformation.setter
-    def deformation(self, value):
-        """赋值时保持设备一致"""
-        self._deformation = value.to(self.get_xyz.device())
-        
-    def extend_from_pcd(self, pcd, kf_id, stiffness, damping):
-        # 在创建新高斯点时初始化物理参数
-        new_stiffness = torch.full((pcd.shape[0],), stiffness)
-        new_damping = torch.full((pcd.shape[0],), damping)
-        self.spring_stiffness = torch.cat([self.spring_stiffness, new_stiffness])
-        self.damping_factor = torch.cat([self.damping_factor, new_damping])
-        
     def build_covariance_from_scaling_rotation(
         self, scaling, scaling_modifier, rotation
     ):
@@ -308,12 +279,6 @@ class GaussianModel:
                 "name": "rotation",
             },
         ]
-        # ===== 新增形变参数组 =====
-        l.append({
-            'params': [self._deformation],
-            'lr': self.deformation_lr * training_args.position_lr_init,
-            "name": "deformation"
-        })
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(
@@ -722,30 +687,9 @@ class GaussianModel:
                 torch.logical_or(prune_mask, big_points_vs), big_points_ws
             )
         self.prune_points(prune_mask)
-        valid_points_mask = ~prune_mask
-        self.anchor_weights = self.anchor_weights[valid_points_mask]
-        self._deformation = self._deformation[valid_points_mask]
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(
             viewspace_point_tensor.grad[update_filter, :2], dim=-1, keepdim=True
         )
         self.denom[update_filter] += 1
-
-    def clone_gaussians(self, selected_pts):
-        """复制高斯点时同步物理属性"""
-        # 原有克隆逻辑
-        cloned = super().clone_gaussians(selected_pts)
-        
-        # 同步物理属性
-        cloned.anchor_weights = self.anchor_weights[selected_pts].clone()
-        cloned._deformation = self._deformation[selected_pts].clone()
-        
-        return cloned
-
-    # ===== 新增物理方法 =====
-    def apply_deformation(self):
-        """应用形变到位置属性（需在优化步骤后显式调用）"""
-        with torch.no_grad():
-            self._xyz += self._deformation
-            self._deformation.fill_(0)  # 重置位移

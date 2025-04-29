@@ -13,8 +13,6 @@ import open3d.visualization.rendering as rendering
 import torch
 import torch.nn.functional as F
 from OpenGL import GL as gl
-from vispy import visuals, scene
-from vispy.visuals import LineVisual
 
 from gaussian_splatting.gaussian_renderer import render
 from gaussian_splatting.utils.graphics_utils import fov2focal, getWorld2View2
@@ -682,111 +680,12 @@ class SLAM_GUI:
 
             gui.Application.instance.post_to_main_thread(self.window, update)
 
-class Renderer:
-    def __init__(self):
-        # 初始化画布
-        self.canvas = scene.SceneCanvas(keys='interactive', show=True)
-        self.view = self.canvas.central_widget.add_view()
-        self.view.camera = 'turntable'
-        
-        # 高斯点云可视化
-        self.gaussian_scatter = visuals.Markers()
-        self.view.add(self.gaussian_scatter)
-        
-        # 弹簧系统可视化
-        self.spring_lines = []  # 存储所有弹簧线段
-        self.spring_visual = scene.visuals.Line(
-            pos=np.zeros((1,3)), 
-            color=(1,0,0,1), 
-            width=2,
-            parent=self.view.scene
-        )
-        self.spring_visible = False
-
-    def update_springs(self, anchors, connections):
-        """完全具体的弹簧数据更新方法"""
-        # 清除旧数据
-        self.spring_lines = []
-        
-        # 构建线段数据 (格式: [point1, point2, point3, point4,...])
-        line_pos = []
-        for i in range(anchors.shape[0]):
-            for j in connections[i]:
-                if j < anchors.shape[0]:  # 确保连接索引有效
-                    line_pos.extend([anchors[i], anchors[j]])
-        
-        if len(line_pos) > 0:
-            line_pos = np.array(line_pos)
-            self.spring_visual.set_data(
-                pos=line_pos,
-                color=(1,0,0,1)  # 红色半透明
-            )
-            self.spring_visible = True
-        else:
-            self.spring_visible = False
-
-    def on_draw(self, event):
-        """完整的绘制逻辑"""
-        # 绘制高斯点云 (原有逻辑)
-        if hasattr(self, 'gaussian_positions'):
-            self.gaussian_scatter.set_data(
-                self.gaussian_positions,
-                edge_color=None,
-                face_color=self.gaussian_colors,
-                size=self.gaussian_sizes
-            )
-        
-        # 绘制弹簧系统
-        if self.spring_visible:
-            self.spring_visual.draw()
-
-    def update(self):
-        """完整的画面更新"""
-        self.canvas.update()
-        self.canvas.events.draw()
 
 def run(params_gui=None):
-    # Open3D GUI初始化 (完全保留原有部分)
     app = o3d.visualization.gui.Application.instance
     app.initialize()
-    
-    # 创建VisPy渲染器（新增）
-    vispy_canvas = Renderer()
-    
-    # 创建Open3D窗口（原有）
     win = SLAM_GUI(params_gui)
-    
-    # 主循环（修改后）
-    while True:
-        # 处理Open3D事件（原有）
-        app.run_one_tick()
-        
-        # 处理VisPy渲染（新增）
-        if not params_gui.q_main2vis.empty():
-            packet = params_gui.q_main2vis.get()
-            
-            # 处理高斯点数据（原有完整逻辑）
-            if isinstance(packet, GaussianPacket):
-                vispy_canvas.gaussian_positions = packet.positions
-                vispy_canvas.gaussian_colors = packet.colors
-                vispy_canvas.gaussian_sizes = packet.sizes
-                
-                # 同步到Open3D窗口
-                win.update_gaussians(packet)
-            
-            # 处理弹簧数据（新增完整逻辑）
-            elif isinstance(packet, SpringPacket):
-                vispy_canvas.update_springs(
-                    anchors=packet.anchors,
-                    connections=packet.connections
-                )
-        
-        # 更新VisPy渲染（新增）
-        vispy_canvas.update()
-        
-        # 退出条件检查（原有）
-        if win.should_close:
-            break
+    app.run()
 
 
 def main():
@@ -794,6 +693,20 @@ def main():
     app.initialize()
     win = SLAM_GUI()
     app.run()
+
+def visualize_spring_model(self, anchor_points, spring_connections):
+    """可视化锚点和弹簧连接"""
+    if not self.config["Training"]["spring_model"]["visualize"]:
+        return
+        
+    # 绘制锚点
+    for point in anchor_points:
+        self.draw_point(point, color=(1, 0, 0))  # 红色表示锚点
+        
+    # 绘制弹簧连接
+    for connection in spring_connections:
+        start_point, end_point = connection
+        self.draw_line(start_point, end_point, color=(0, 1, 0))  # 绿色表示弹簧连接
 
 
 if __name__ == "__main__":
