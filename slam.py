@@ -29,6 +29,13 @@ class SLAM:
 
         start.record()
 
+        # 确保多进程环境正确初始化，使用 spawn 方法
+        try:
+            mp.set_start_method('spawn', force=True)
+        except RuntimeError:
+            # 如果已经设置过启动方法，就忽略错误
+            pass
+
         self.config = config
         self.save_dir = save_dir
         model_params = munchify(config["model_params"])
@@ -57,8 +64,14 @@ class SLAM:
 
         model_params.sh_degree = 3 if self.use_spherical_harmonics else 0
 
-        self.gaussians = GaussianModel(model_params.sh_degree, config=self.config)
-        self.gaussians.init_lr(6.0)
+        # 初始化 gaussians 并确保它被正确创建
+        try:
+            self.gaussians = GaussianModel(model_params.sh_degree, config=self.config)
+            self.gaussians.init_lr(6.0)
+        except Exception as e:
+            Log(f"Error initializing gaussians: {str(e)}")
+            raise
+
         self.dataset = load_dataset(
             model_params, model_params.source_path, config=config
         )
@@ -67,6 +80,7 @@ class SLAM:
         bg_color = [0, 0, 0]
         self.background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
+        # 使用进程安全的队列
         frontend_queue = mp.Queue()
         backend_queue = mp.Queue()
 
@@ -76,9 +90,11 @@ class SLAM:
         self.config["Results"]["save_dir"] = save_dir
         self.config["Training"]["monocular"] = self.monocular
 
+        # 初始化前端和后端
         self.frontend = FrontEnd(self.config)
         self.backend = BackEnd(self.config)
 
+        # 设置前端属性
         self.frontend.dataset = self.dataset
         self.frontend.background = self.background
         self.frontend.pipeline_params = self.pipeline_params
@@ -87,6 +103,7 @@ class SLAM:
         self.frontend.q_main2vis = q_main2vis
         self.frontend.q_vis2main = q_vis2main
         self.frontend.set_hyperparams()
+        self.frontend.gaussians = self.gaussians  # 确保前端有 gaussians 引用
         
         # 设置弹簧模型参数
         if self.spring_model_enabled:
@@ -227,7 +244,11 @@ if __name__ == "__main__":
     if args.gt_pose:
         os.environ["USE_GT_POSE"] = "True"
 
-    mp.set_start_method("spawn")
+    # 强制使用 spawn 方法，因为我们使用了 CUDA
+    try:
+        mp.set_start_method('spawn')
+    except RuntimeError:
+        pass
 
     with open(args.config, "r") as yml:
         config = yaml.safe_load(yml)

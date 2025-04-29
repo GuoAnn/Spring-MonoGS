@@ -157,7 +157,7 @@ def get_median_depth(depth, opacity=None, mask=None, return_std=False):
 
 def compute_spring_energy(anchor_points, spring_model):
     """计算弹簧系统的总能量"""
-    energy = 0.0
+    energy = torch.zeros(1, device=anchor_points.device)
     for i in range(len(anchor_points)):
         for j in spring_model.knn_index[i]:
             delta = anchor_points[i] - anchor_points[j]

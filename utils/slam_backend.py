@@ -40,11 +40,18 @@ class BackEnd(mp.Process):
         self.initialized = not self.monocular
         self.keyframe_optimizers = None
         
-        # 添加弹簧模型相关属性
+        # 弹簧模型相关属性
         self.spring_models = {}  # 存储每个关键帧的弹簧模型
         self.anchor_points = {}  # 存储每个关键帧的锚点
         self.template_anchors = None  # 存储模板帧的锚点
         self.anchor_velocities = {}  # 存储每个关键帧锚点的速度
+        self.spring_model_enabled = config["Training"]["spring_model"]["enabled"]
+        
+        # 弹簧模型参数
+        self.spring_k = config["Training"]["spring_model"].get("spring_k", 0.1)  # 弹性系数
+        self.damping = config["Training"]["spring_model"].get("damping", 0.01)  # 阻尼系数
+        self.dt = config["Training"]["spring_model"].get("dt", 0.01)  # 时间步长
+        self.n_iters = config["Training"]["spring_model"].get("n_iters", 10)  # 迭代次数
 
     def set_hyperparams(self):
         self.save_results = self.config["Results"]["save_results"]
@@ -92,6 +99,12 @@ class BackEnd(mp.Process):
             self.backend_queue.get()
 
     def initialize_map(self, cur_frame_idx, viewpoint):
+        """初始化地图"""
+        # 确保高斯点正确初始化
+        if self.gaussians is None or self.gaussians.get_xyz is None:
+            Log("Error: Gaussians not properly initialized")
+            return None
+
         for mapping_iteration in range(self.init_itr_num):
             self.iteration_count += 1
             render_pkg = render(
@@ -143,52 +156,106 @@ class BackEnd(mp.Process):
                 self.gaussians.optimizer.step()
                 self.gaussians.optimizer.zero_grad(set_to_none=True)
 
+        # 在地图初始化完成后创建锚点
+        if self.spring_model_enabled and self.gaussians.get_xyz is not None:
+            gaussian_points = self.gaussians.get_xyz
+            if gaussian_points.numel() > 0:
+                anchor_points = self.generate_anchor_points(gaussian_points)
+                self.anchor_points[cur_frame_idx] = anchor_points
+                self.template_anchors = anchor_points  # 将第一帧设为模板
+                Log(f"Created initial anchor points for frame {cur_frame_idx}")
+
         self.occ_aware_visibility[cur_frame_idx] = (n_touched > 0).long()
         Log("Initialized map")
         return render_pkg
 
+    def generate_anchor_points(self, gaussian_points):
+        """从高斯点中生成锚点"""
+        n_anchors = self.config["Training"]["spring_model"]["n_anchors"]
+        device = gaussian_points.device
+        
+        # 如果高斯点数量少于要求的锚点数，直接使用所有高斯点
+        if gaussian_points.shape[0] <= n_anchors:
+            return gaussian_points
+        
+        # 计算点云边界框
+        min_coords = torch.min(gaussian_points, dim=0)[0]
+        max_coords = torch.max(gaussian_points, dim=0)[0]
+        
+        # 在边界框内随机采样点
+        anchor_points = torch.rand(n_anchors, 3, device=device)
+        anchor_points = anchor_points * (max_coords - min_coords) + min_coords
+        
+        # 找到每个锚点的最近高斯点
+        from pytorch3d.ops import knn_points
+        _, knn_idx, _ = knn_points(anchor_points.unsqueeze(0), gaussian_points.unsqueeze(0), K=1)
+        anchor_points = gaussian_points[knn_idx.squeeze(0).squeeze(1)]
+        
+        return anchor_points
+
     def optimize_spring_model(self, current_window):
-        """优化弹簧模型参数"""
+        """优化弹簧模型参数和锚点位置"""
+        if not self.spring_model_enabled:
+            return
+            
         if len(current_window) < 2:
             return
             
-        # 获取模板帧的锚点
+        # 获取模板帧（第一帧）的锚点
         template_idx = current_window[0]
-        if self.template_anchors is None:
+        if self.template_anchors is None and template_idx in self.anchor_points:
             self.template_anchors = self.anchor_points[template_idx]
+            Log(f"Set template anchors from frame {template_idx}")
+            
+        if self.template_anchors is None:
+            Log("Warning: No template anchors available")
+            return
             
         # 对每个非模板帧进行优化
         for frame_idx in current_window[1:]:
-            if frame_idx not in self.anchor_velocities:
-                self.anchor_velocities[frame_idx] = torch.zeros_like(self.anchor_points[frame_idx])
+            if frame_idx not in self.anchor_points:
+                continue
                 
-            # 获取当前帧的锚点和弹簧模型
+            # 获取当前帧的锚点
             current_anchors = self.anchor_points[frame_idx]
-            spring_model = self.spring_models[frame_idx]
             
-            # 计算锚点位移
-            anchor_deltas = current_anchors - self.template_anchors
+            # 初始化或获取速度
+            if frame_idx not in self.anchor_velocities:
+                self.anchor_velocities[frame_idx] = torch.zeros_like(current_anchors)
             
-            # 使用弹簧模型更新锚点位置
-            dt = 0.01  # 时间步长
-            for _ in range(10):  # 迭代次数
-                current_anchors, self.anchor_velocities[frame_idx] = spring_model.step(
-                    current_anchors, 
-                    self.anchor_velocities[frame_idx],
-                    dt
-                )
+            # 计算形变能量和物理约束
+            for _ in range(self.n_iters):
+                # 计算弹簧力
+                delta_pos = current_anchors - self.template_anchors
+                dist = torch.norm(delta_pos, dim=1, keepdim=True)
+                force = -self.spring_k * delta_pos  # 弹簧力
                 
+                # 添加阻尼力
+                velocity = self.anchor_velocities[frame_idx]
+                damping_force = -self.damping * velocity
+                
+                # 合力
+                total_force = force + damping_force
+                
+                # 更新速度和位置
+                self.anchor_velocities[frame_idx] = velocity + total_force * self.dt
+                current_anchors = current_anchors + self.anchor_velocities[frame_idx] * self.dt
+            
             # 更新锚点位置
             self.anchor_points[frame_idx] = current_anchors
             
-            # 使用IDW插值更新高斯点位置
-            gaussian_points = self.gaussians.get_xyz
-            updated_gaussians = self.interpolate_gaussians(
-                current_anchors,
-                gaussian_points,
-                current_anchors - self.template_anchors
-            )
-            self.gaussians.update_xyz(updated_gaussians)
+            # 使用锚点位置更新高斯点（每个关键帧只更新一次）
+            if self.gaussians.get_xyz is not None:
+                gaussian_points = self.gaussians.get_xyz
+                if gaussian_points.numel() > 0:
+                    updated_positions = self.interpolate_gaussians(
+                        current_anchors,
+                        gaussian_points,
+                        current_anchors - self.template_anchors
+                    )
+                    # 使用正确的方式更新高斯点位置
+                    self.gaussians._xyz.data.copy_(updated_positions)
+                    Log(f"Updated gaussian points for frame {frame_idx}")
 
     def interpolate_gaussians(self, anchor_points, gaussian_points, anchor_deltas):
         """使用IDW插值更新高斯点位置"""

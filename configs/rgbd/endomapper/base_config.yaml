@@ -1,5 +1,5 @@
 ## SLAM parameters
-Results:
+Results: 
   save_results: True
   save_dir: "results"
   save_trj: True

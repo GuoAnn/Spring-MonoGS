@@ -32,12 +32,39 @@ class SpringModel:
         self.damping = torch.ones_like(self.origin_len) * 0.01  # 阻尼系数
         
     def knn(self, x, ref, k, rm_self=False):
+        # 确保输入张量有效且不为空
+        if x is None or ref is None:
+            raise ValueError("Input tensors cannot be None")
+            
+        # 打印输入张量的形状以便调试
+        Log(f"Input tensor shapes - x: {x.shape}, ref: {ref.shape}")
+        
+        # 确保输入张量至少是2维的
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+        if ref.dim() == 1:
+            ref = ref.unsqueeze(0)
+            
+        # 添加批次维度（如果需要）
+        if x.dim() == 2:
+            x = x.unsqueeze(0)
+        if ref.dim() == 2:
+            ref = ref.unsqueeze(0)
+            
+        # 确保点云维度正确 (B, N, 3)
+        if x.shape[-1] != 3:
+            if x.shape[1] == 3:  # 如果是 (B, 3, N) 格式
+                x = x.permute(0, 2, 1)
+        if ref.shape[-1] != 3:
+            if ref.shape[1] == 3:  # 如果是 (B, 3, N) 格式
+                ref = ref.permute(0, 2, 1)
+                
         if rm_self:
-            dist, knn_idx, _ = knn_points(x.unsqueeze(0), ref.unsqueeze(0), K=k+1, return_nn=True)
+            dist, knn_idx, _ = knn_points(x, ref, K=k+1, return_nn=True)
             dist = dist.squeeze(0)[:, 1:]
             knn_idx = knn_idx.squeeze(0)[:, 1:]
         else:
-            dist, knn_idx, _ = knn_points(x.unsqueeze(0), ref.unsqueeze(0), K=k, return_nn=True)
+            dist, knn_idx, _ = knn_points(x, ref, K=k, return_nn=True)
             dist = dist.squeeze(0)
             knn_idx = knn_idx.squeeze(0)
         return torch.sqrt(dist), knn_idx, None
@@ -100,6 +127,10 @@ class FrontEnd(mp.Process):
         self.anchor_points = {}  # 存储每个关键帧的锚点
         self.k_neighbors = 8  # 弹簧连接的近邻点数量
         self.n_anchors = 1000  # 每个关键帧的锚点数量
+        
+        # 确保 CUDA 在子进程中正确初始化
+        torch.cuda.set_device(self.device)
+        torch.cuda.init()
 
     def set_hyperparams(self):
         self.save_dir = self.config["Results"]["save_dir"]
@@ -111,6 +142,12 @@ class FrontEnd(mp.Process):
         self.kf_interval = self.config["Training"]["kf_interval"]
         self.window_size = self.config["Training"]["window_size"]
         self.single_thread = self.config["Training"]["single_thread"]
+
+        # 添加弹簧模型参数
+        self.spring_model_enabled = self.config["Training"]["spring_model"]["enabled"]
+        if self.spring_model_enabled:
+            self.k_neighbors = self.config["Training"]["spring_model"]["k_neighbors"]
+            self.n_anchors = self.config["Training"]["spring_model"]["n_anchors"]
 
     def generate_anchor_points(self, gaussian_points):
         """从高斯点中生成锚点"""
@@ -152,11 +189,30 @@ class FrontEnd(mp.Process):
         gt_img = viewpoint.original_image.cuda()
         valid_rgb = (gt_img.sum(dim=0) > rgb_boundary_threshold)[None]
         
-        # 生成锚点和弹簧模型
-        gaussian_points = self.gaussians.get_xyz
-        anchor_points = self.generate_anchor_points(gaussian_points)
-        self.anchor_points[cur_frame_idx] = anchor_points
-        self.spring_models[cur_frame_idx] = SpringModel(anchor_points, self.k_neighbors)
+        # 检查 self.gaussians 是否已初始化
+        if hasattr(self, 'gaussians') and self.gaussians is not None:
+            gaussian_points = self.gaussians.get_xyz
+            
+            # 确保 gaussian_points 是有效的张量
+            if gaussian_points is None or gaussian_points.numel() == 0:
+                Log("Warning: No valid gaussian points available")
+                self.anchor_points[cur_frame_idx] = None
+                self.spring_models[cur_frame_idx] = None
+            else:
+                # 确保 gaussian_points 具有正确的形状
+                if gaussian_points.dim() == 1:
+                    gaussian_points = gaussian_points.view(-1, 3)
+                elif gaussian_points.dim() == 3:
+                    gaussian_points = gaussian_points.squeeze(0)
+                    
+                Log(f"Gaussian points shape: {gaussian_points.shape}")
+                anchor_points = self.generate_anchor_points(gaussian_points)
+                self.anchor_points[cur_frame_idx] = anchor_points
+                self.spring_models[cur_frame_idx] = SpringModel(anchor_points, self.k_neighbors)
+        else:
+            # 如果是初始化阶段，创建空的锚点和弹簧模型
+            self.anchor_points[cur_frame_idx] = None
+            self.spring_models[cur_frame_idx] = None
         
         if self.monocular:
             if depth is None:
@@ -443,6 +499,10 @@ class FrontEnd(mp.Process):
             torch.cuda.empty_cache()
 
     def run(self):
+        # 在子进程中重新初始化 CUDA
+        torch.cuda.set_device(self.device)
+        torch.cuda.init()
+
         cur_frame_idx = 0
         projection_matrix = getProjectionMatrix2(
             znear=0.01,
