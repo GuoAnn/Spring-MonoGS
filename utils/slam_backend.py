@@ -255,7 +255,10 @@ class BackEnd(mp.Process):
                     )
                     # 使用正确的方式更新高斯点位置
                     self.gaussians._xyz.data.copy_(updated_positions)
-                    Log(f"Updated gaussian points for frame {frame_idx}")
+                    # 只在第一次更新时输出日志
+                    if not hasattr(self, '_updated_frame_' + str(frame_idx)):
+                        Log(f"Updated gaussian points for frame {frame_idx}")
+                        setattr(self, '_updated_frame_' + str(frame_idx), True)
 
     def interpolate_gaussians(self, anchor_points, gaussian_points, anchor_deltas):
         """使用IDW插值更新高斯点位置"""

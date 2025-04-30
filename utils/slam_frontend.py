@@ -151,24 +151,61 @@ class FrontEnd(mp.Process):
 
     def generate_anchor_points(self, gaussian_points):
         """从高斯点中生成锚点"""
-        # 使用体积采样选择锚点
-        n_points = gaussian_points.shape[0]
-        if n_points <= self.n_anchors:
-            return gaussian_points
-        
-        # 计算点云边界框
-        min_coords = torch.min(gaussian_points, dim=0)[0]
-        max_coords = torch.max(gaussian_points, dim=0)[0]
-        
-        # 在边界框内随机采样点
-        anchor_points = torch.rand(self.n_anchors, 3, device=self.device)
-        anchor_points = anchor_points * (max_coords - min_coords) + min_coords
-        
-        # 找到每个锚点的最近高斯点
-        _, knn_idx, _ = knn_points(anchor_points.unsqueeze(0), gaussian_points.unsqueeze(0), K=1)
-        anchor_points = gaussian_points[knn_idx.squeeze(0).squeeze(1)]
-        
-        return anchor_points
+        try:
+            # 确保输入是有效的张量
+            if gaussian_points is None:
+                Log("Warning: gaussian_points is None")
+                return None
+                
+            if not isinstance(gaussian_points, torch.Tensor):
+                Log("Warning: gaussian_points is not a torch.Tensor")
+                return None
+                
+            # 确保点云维度正确
+            if gaussian_points.dim() == 1:
+                gaussian_points = gaussian_points.view(-1, 3)
+            elif gaussian_points.dim() == 3:
+                gaussian_points = gaussian_points.squeeze(0)
+                
+            # 确保张量在正确的设备上
+            gaussian_points = gaussian_points.to(self.device)
+            
+            Log(f"Generating anchor points from {gaussian_points.shape[0]} gaussian points")
+            
+            # 如果点数少于要求的锚点数，直接返回所有点
+            if gaussian_points.shape[0] <= self.n_anchors:
+                Log(f"Using all {gaussian_points.shape[0]} points as anchors")
+                return gaussian_points
+            
+            # 计算点云的边界框
+            min_coords = torch.min(gaussian_points, dim=0)[0]
+            max_coords = torch.max(gaussian_points, dim=0)[0]
+            
+            # 使用FPS (Farthest Point Sampling) 进行采样
+            anchor_points = torch.zeros((self.n_anchors, 3), device=self.device)
+            # 随机选择第一个点
+            first_idx = torch.randint(gaussian_points.shape[0], (1,))
+            anchor_points[0] = gaussian_points[first_idx]
+            
+            # 计算到已选择点的最短距离
+            distances = torch.norm(gaussian_points - anchor_points[0].unsqueeze(0), dim=1)
+            
+            # 选择剩余的点
+            for i in range(1, self.n_anchors):
+                # 选择距离最大的点作为下一个锚点
+                idx = torch.argmax(distances)
+                anchor_points[i] = gaussian_points[idx]
+                
+                # 更新距离
+                new_dists = torch.norm(gaussian_points - anchor_points[i].unsqueeze(0), dim=1)
+                distances = torch.min(distances, new_dists)
+            
+            Log(f"Successfully generated {self.n_anchors} anchor points")
+            return anchor_points
+            
+        except Exception as e:
+            Log(f"Error in generate_anchor_points: {str(e)}")
+            return None
 
     def interpolate_gaussians(self, anchor_points, gaussian_points, anchor_deltas):
         """使用IDW插值更新高斯点位置"""
@@ -192,25 +229,62 @@ class FrontEnd(mp.Process):
         # 检查 self.gaussians 是否已初始化
         if hasattr(self, 'gaussians') and self.gaussians is not None:
             gaussian_points = self.gaussians.get_xyz
-            
-            # 确保 gaussian_points 是有效的张量
-            if gaussian_points is None or gaussian_points.numel() == 0:
-                Log("Warning: No valid gaussian points available")
+        else:
+            # 如果是第一帧，从图像中初始化高斯点
+            if init or cur_frame_idx == 0:
+                # 使用深度图或默认深度初始化高斯点
+                H, W = gt_img.shape[1:]
+                if depth is not None:
+                    z_vals = depth.reshape(-1)
+                else:
+                    # 如果没有深度图，使用默认深度范围
+                    z_vals = torch.ones(H * W, device=self.device) * 4.0  # 默认深度为4米
+                
+                # 创建像素网格
+                y, x = torch.meshgrid(torch.arange(H, device=self.device), 
+                                    torch.arange(W, device=self.device))
+                pixels = torch.stack([x.reshape(-1), y.reshape(-1)], dim=-1)
+                
+                # 反投影到3D空间
+                fx = viewpoint.fx
+                fy = viewpoint.fy
+                cx = viewpoint.cx
+                cy = viewpoint.cy
+                
+                # 计算3D点
+                X = (pixels[:, 0] - cx) * z_vals / fx
+                Y = (pixels[:, 1] - cy) * z_vals / fy
+                Z = z_vals
+                
+                gaussian_points = torch.stack([X, Y, Z], dim=-1)
+                
+                # 只保留有效的RGB区域的点
+                valid_mask = valid_rgb.reshape(-1)
+                gaussian_points = gaussian_points[valid_mask]
+                
+                # 如果点太多，进行下采样
+                if gaussian_points.shape[0] > 2000:
+                    idx = torch.randperm(gaussian_points.shape[0])[:2000]
+                    gaussian_points = gaussian_points[idx]
+            else:
+                gaussian_points = None
+        
+        # 生成锚点并创建弹簧模型
+        if gaussian_points is not None and gaussian_points.numel() > 0:
+            try:
+                anchor_points = self.generate_anchor_points(gaussian_points)
+                if anchor_points is not None:
+                    self.anchor_points[cur_frame_idx] = anchor_points
+                    self.spring_models[cur_frame_idx] = SpringModel(anchor_points, self.k_neighbors)
+                else:
+                    Log(f"Warning: Failed to generate anchor points for frame {cur_frame_idx}")
+                    self.anchor_points[cur_frame_idx] = None
+                    self.spring_models[cur_frame_idx] = None
+            except Exception as e:
+                Log(f"Error while creating spring model for frame {cur_frame_idx}: {str(e)}")
                 self.anchor_points[cur_frame_idx] = None
                 self.spring_models[cur_frame_idx] = None
-            else:
-                # 确保 gaussian_points 具有正确的形状
-                if gaussian_points.dim() == 1:
-                    gaussian_points = gaussian_points.view(-1, 3)
-                elif gaussian_points.dim() == 3:
-                    gaussian_points = gaussian_points.squeeze(0)
-                    
-                Log(f"Gaussian points shape: {gaussian_points.shape}")
-                anchor_points = self.generate_anchor_points(gaussian_points)
-                self.anchor_points[cur_frame_idx] = anchor_points
-                self.spring_models[cur_frame_idx] = SpringModel(anchor_points, self.k_neighbors)
         else:
-            # 如果是初始化阶段，创建空的锚点和弹簧模型
             self.anchor_points[cur_frame_idx] = None
             self.spring_models[cur_frame_idx] = None
         
@@ -388,6 +462,10 @@ class FrontEnd(mp.Process):
         kf_translation = self.config["Training"]["kf_translation"]
         kf_min_translation = self.config["Training"]["kf_min_translation"]
         kf_overlap = self.config["Training"]["kf_overlap"]
+        
+        # 添加帧数间隔条件：每10帧强制选择一个关键帧
+        if cur_frame_idx - last_keyframe_idx >= 10:
+            return True
 
         curr_frame = self.cameras[cur_frame_idx]
         last_kf = self.cameras[last_keyframe_idx]
