@@ -47,6 +47,11 @@ class BackEnd(mp.Process):
         self.template_anchors = None  # 存储模板帧的锚点
         self.anchor_velocities = {}  # 存储每个关键帧锚点的速度
         self.spring_model_enabled = config["Training"]["spring_model"]["enabled"]
+        # 新增：锚点相关属性字典，防止AttributeError
+        self.anchor_indices = {}
+        self.anchor_features_dc = {}
+        self.anchor_features_rest = {}
+        self.anchor_opacity = {}
         
         # 弹簧模型参数
         self.spring_k = config["Training"]["spring_model"].get("spring_k", 0.1)  # 弹性系数
@@ -90,7 +95,7 @@ class BackEnd(mp.Process):
         self.gaussians.extend_from_pcd_seq(
             viewpoint, kf_id=frame_idx, init=init, scale=scale, depthmap=depth_map
         )
-        Log(f"[DEBUG] after add_next_kf: gaussians.get_xyz shape: {self.gaussians.get_xyz.shape if self.gaussians.get_xyz is not None else 'None'}")
+        #Log(f"[DEBUG] after add_next_kf: gaussians.get_xyz shape: {self.gaussians.get_xyz.shape if self.gaussians.get_xyz is not None else 'None'}")
 
     def reset(self):
         self.iteration_count = 0
@@ -102,7 +107,7 @@ class BackEnd(mp.Process):
 
         # remove all gaussians
         self.gaussians.prune_points(self.gaussians.unique_kfIDs >= 0)
-        Log(f"[DEBUG] after reset: gaussians.get_xyz shape: {self.gaussians.get_xyz.shape if self.gaussians.get_xyz is not None else 'None'}")
+        #Log(f"[DEBUG] after reset: gaussians.get_xyz shape: {self.gaussians.get_xyz.shape if self.gaussians.get_xyz is not None else 'None'}")
         # remove everything from the queues
         while not self.backend_queue.empty():
             self.backend_queue.get()
@@ -169,54 +174,16 @@ class BackEnd(mp.Process):
         if self.spring_model_enabled and self.gaussians.get_xyz is not None:
             gaussian_points = self.gaussians.get_xyz
             if gaussian_points.numel() > 0:
-                anchor_points = self.generate_anchor_points(gaussian_points)
-                self.anchor_points[cur_frame_idx] = anchor_points
-                self.template_anchors = anchor_points  # 将第一帧设为模板
+                # 注释掉后端的generate_anchor_points函数（只保留前端采样）
+                # anchor_points, anchor_indices, anchor_features_dc, anchor_features_rest, anchor_opacity = self.generate_anchor_points(gaussian_points)
+                # self.anchor_points[cur_frame_idx] = anchor_points
+                # self.template_anchors = anchor_points  # 将第一帧设为模板
                 Log(f"Created initial anchor points for frame {cur_frame_idx}")
 
         self.occ_aware_visibility[cur_frame_idx] = (n_touched > 0).long()
         Log("Initialized map")
         return render_pkg
 
-    def generate_anchor_points(self, gaussian_points):
-        """从高斯点中生成锚点"""
-        try:
-            n_anchors = self.config["Training"]["spring_model"]["n_anchors"]
-            if gaussian_points is None:
-                Log("Warning: gaussian_points is None")
-                return None
-
-            if not isinstance(gaussian_points, torch.Tensor):
-                Log("Warning: gaussian_points is not a torch.Tensor")
-                return None
-
-            if gaussian_points.dim() == 1:
-                gaussian_points = gaussian_points.view(-1, 3)
-            elif gaussian_points.dim() == 3:
-                gaussian_points = gaussian_points.squeeze(0)
-
-            gaussian_points = gaussian_points.to(self.device)
-
-            Log(f"Generating anchor points from {gaussian_points.shape[0]} gaussian points")
-
-            if gaussian_points.shape[0] <= n_anchors:
-                Log(f"Using all {gaussian_points.shape[0]} points as anchors")
-                return gaussian_points
-
-            anchor_points = torch.zeros((n_anchors, 3), device=self.device)
-            first_idx = torch.randint(gaussian_points.shape[0], (1,))
-            anchor_points[0] = gaussian_points[first_idx]
-            distances = torch.norm(gaussian_points - anchor_points[0].unsqueeze(0), dim=1)
-            for i in range(1, n_anchors):
-                idx = torch.argmax(distances)
-                anchor_points[i] = gaussian_points[idx]
-                new_dists = torch.norm(gaussian_points - anchor_points[i].unsqueeze(0), dim=1)
-                distances = torch.min(distances, new_dists)
-            Log(f"Successfully generated {n_anchors} anchor points")
-            return anchor_points
-        except Exception as e:
-            Log(f"Error in generate_anchor_points: {str(e)}")
-            return None
 
     def optimize_spring_model(self, current_window):
         """优化弹簧模型参数和锚点位置"""
@@ -277,16 +244,21 @@ class BackEnd(mp.Process):
                 if self.gaussians.get_xyz is not None:
                     gaussian_points = self.gaussians.get_xyz
                     if gaussian_points.numel() > 0:
-                        updated_positions = self.interpolate_gaussians(
-                            current_anchors,
-                            gaussian_points,
-                            current_anchors - self.template_anchors
-                        )
+                        # 注释掉后端的interpolate_gaussians函数（只保留前端采样）
+                        # updated_positions = self.interpolate_gaussians(
+                        #     current_anchors,
+                        #     gaussian_points,
+                        #     current_anchors - self.template_anchors,
+                        #     self.gaussians._features_dc[current_anchors],
+                        #     self.gaussians._features_rest[current_anchors],
+                        #     self.gaussians._opacity[current_anchors],
+                        #     "idw"
+                        # )
                         # 检查插值结果有效性
-                        if torch.isnan(updated_positions).any() or torch.isinf(updated_positions).any():
-                            Log("Warning: Invalid positions detected, skipping gaussian update for this frame.")
-                            continue
-                        self.gaussians._xyz.data.copy_(updated_positions)
+                        # if torch.isnan(updated_positions).any() or torch.isinf(updated_positions).any():
+                        #     Log("Warning: Invalid positions detected, skipping gaussian update for this frame.")
+                        #     continue
+                        # self.gaussians._xyz.data.copy_(updated_positions)
                         if not hasattr(self, '_updated_frame_' + str(frame_idx)):
                             setattr(self, '_updated_frame_' + str(frame_idx), True)
                             Log(f"Updated gaussian points for frame {frame_idx}")
@@ -295,7 +267,8 @@ class BackEnd(mp.Process):
             Log(f"Spring model error: {e}")
             # 不提前return，保证主流程继续
 
-    def interpolate_gaussians(self, anchor_points, gaussian_points, anchor_deltas):
+    def interpolate_gaussians(self, anchor_points, gaussian_points, anchor_deltas, 
+                              anchor_features_dc=None, anchor_features_rest=None, anchor_opacity=None, mode="idw"):
         """
         使用IDW插值更新高斯点所有属性
         """
@@ -303,7 +276,7 @@ class BackEnd(mp.Process):
         K_BINDING = min(16, anchor_points.shape[0])
         dist, idx, _ = knn_points(gaussian_points.unsqueeze(0), anchor_points.unsqueeze(0), K=K_BINDING)
         dist = dist.squeeze(0)  # [N, K]
-        idx = idx.squeeze(0)    # [N, K]
+        idx = idx.squeeze(0).long()    # [N, K]，确保为long类型
 
         # 数值稳定性：距离不能为0
         dist = torch.clamp(dist, min=1e-6)
@@ -311,8 +284,6 @@ class BackEnd(mp.Process):
         weights = 1.0 / (dist.sqrt() + eps)  # [N, K]
         weights = weights / (weights.sum(dim=1, keepdim=True) + eps)  # 归一化
 
-        # 获取所有高斯点属性
-        # 以self.gaussians为例，假设有get_xyz, get_opacity, get_scaling, get_rotation, get_features等
         N = gaussian_points.shape[0]
         new_attrs = {}
 
@@ -324,35 +295,37 @@ class BackEnd(mp.Process):
         new_attrs['xyz'] = new_xyz
 
         # 2. 颜色（SH特征）
-        anchor_features_dc = self.gaussians._features_dc[idx]  # [N, K, ...]
-        anchor_features_rest = self.gaussians._features_rest[idx]  # [N, K, ...]
-        new_features_dc = (anchor_features_dc * weights.unsqueeze(-1).unsqueeze(-1)).sum(dim=1)
-        new_features_rest = (anchor_features_rest * weights.unsqueeze(-1).unsqueeze(-1)).sum(dim=1)
+        if mode == "nearest":
+            nearest_idx = idx[:, 0].long()  # [N]
+            new_features_dc = anchor_features_dc[nearest_idx]
+            new_features_rest = anchor_features_rest[nearest_idx]
+            new_opacity = anchor_opacity[nearest_idx]
+        else:
+            new_features_dc = (anchor_features_dc[idx] * weights.unsqueeze(-1).unsqueeze(-1)).sum(dim=1)
+            new_features_rest = (anchor_features_rest[idx] * weights.unsqueeze(-1).unsqueeze(-1)).sum(dim=1)
+            new_opacity = (anchor_opacity[idx] * weights.unsqueeze(-1)).sum(dim=1)
         new_attrs['features_dc'] = new_features_dc
         new_attrs['features_rest'] = new_features_rest
 
         # 3. 不透明度
-        anchor_opacity = self.gaussians._opacity[idx]  # [N, K, 1]
-        new_opacity = (anchor_opacity * weights.unsqueeze(-1)).sum(dim=1)
+        new_opacity = (new_opacity * weights.unsqueeze(-1)).sum(dim=1)
         new_attrs['opacity'] = new_opacity
 
         # 4. 尺度
-        anchor_scaling = self.gaussians._scaling[idx]  # [N, K, ...]
+        anchor_scaling = self.gaussians._scaling[idx]
         new_scaling = (anchor_scaling * weights.unsqueeze(-1)).sum(dim=1)
         new_attrs['scaling'] = new_scaling
 
-        # 5. 旋转（如有，建议用四元数slerp插值，否则线性插值）
-        anchor_rotation = self.gaussians._rotation[idx]  # [N, K, ...]
+        # 5. 旋转
+        anchor_rotation = self.gaussians._rotation[idx]
         new_rotation = (anchor_rotation * weights.unsqueeze(-1)).sum(dim=1)
         new_attrs['rotation'] = new_rotation
 
-        # 检查插值结果
         for k, v in new_attrs.items():
             if torch.isnan(v).any() or torch.isinf(v).any():
                 Log(f"Warning: Invalid {k} detected in interpolated gaussian points, skipping update.")
-                return getattr(self.gaussians, f"_{k}").data  # 返回原始点，避免污染
+                return getattr(self.gaussians, f"_{k}").data
 
-        # 批量更新self.gaussians的所有属性
         self.gaussians._xyz.data.copy_(new_attrs['xyz'])
         self.gaussians._features_dc.data.copy_(new_attrs['features_dc'])
         self.gaussians._features_rest.data.copy_(new_attrs['features_rest'])
@@ -360,13 +333,13 @@ class BackEnd(mp.Process):
         self.gaussians._scaling.data.copy_(new_attrs['scaling'])
         self.gaussians._rotation.data.copy_(new_attrs['rotation'])
 
-        return new_attrs['xyz']  # 兼容原有调用
+        return new_attrs['xyz']
 
     def map(self, current_window, prune=False, iters=1):
         # --- DEBUG: map开始时高斯点状态 ---
         cur_shape = self.gaussians.get_xyz.shape if self.gaussians is not None and hasattr(self.gaussians, "get_xyz") and self.gaussians.get_xyz is not None else None
         if cur_shape != self._last_gaussian_shape:
-            Log(f"[DEBUG] map start: gaussians.get_xyz shape: {cur_shape}")
+            #Log(f"[DEBUG] map start: gaussians.get_xyz shape: {cur_shape}")
             self._last_gaussian_shape = cur_shape
         
         if len(current_window) == 0:
@@ -542,10 +515,10 @@ class BackEnd(mp.Process):
                         if to_prune is not None and self.monocular:
                             self.gaussians.prune_points(to_prune.cuda())
                             # DEBUG: prune_points后高斯点状态
-                            if self.gaussians.get_xyz is not None:
-                                Log(f"[DEBUG] after prune_points: gaussians.get_xyz shape: {self.gaussians.get_xyz.shape}")
-                            else:
-                                Log("[DEBUG] after prune_points: gaussians.get_xyz is None")
+                            #if self.gaussians.get_xyz is not None:
+                                #Log(f"[DEBUG] after prune_points: gaussians.get_xyz shape: {self.gaussians.get_xyz.shape}")
+                            #else:
+                                #Log("[DEBUG] after prune_points: gaussians.get_xyz is None")
                             if self.gaussians.get_xyz is None or self.gaussians.get_xyz.numel() == 0:
                                 Log("Warning: All gaussians have been pruned! Restoring at least one point.")
                                 return False
@@ -579,12 +552,12 @@ class BackEnd(mp.Process):
                         )
                         # DEBUG: densify_and_prune后高斯点状态
                         if self.gaussians.get_xyz is not None:
-                            Log(f"[DEBUG] after densify_and_prune: gaussians.get_xyz shape: {self.gaussians.get_xyz.shape}")
+                            #Log(f"[DEBUG] after densify_and_prune: gaussians.get_xyz shape: {self.gaussians.get_xyz.shape}")
                             if self.gaussians.get_xyz.shape[0] == 0:
                                 Log("Warning: All gaussians have been pruned by densify_and_prune! Skipping this prune.")
                                 return False
                         else:
-                            Log("[DEBUG] after densify_and_prune: gaussians.get_xyz is None")
+                            #Log("[DEBUG] after densify_and_prune: gaussians.get_xyz is None")
                             return False
                     gaussian_split = True
 
@@ -601,10 +574,10 @@ class BackEnd(mp.Process):
                     else:
                         self.gaussians.reset_opacity_nonvisible(visibility_filter_acm)
                     # DEBUG: reset_opacity_nonvisible后高斯点状态
-                    if self.gaussians.get_xyz is not None:
-                        Log(f"[DEBUG] after reset_opacity_nonvisible: gaussians.get_xyz shape: {self.gaussians.get_xyz.shape}")
-                    else:
-                        Log("[DEBUG] after reset_opacity_nonvisible: gaussians.get_xyz is None")
+                    #if self.gaussians.get_xyz is not None:
+                        #Log(f"[DEBUG] after reset_opacity_nonvisible: gaussians.get_xyz shape: {self.gaussians.get_xyz.shape}")
+                    #else:
+                        #Log("[DEBUG] after reset_opacity_nonvisible: gaussians.get_xyz is None")
                     if self.gaussians.get_xyz is None or self.gaussians.get_xyz.numel() == 0:
                         Log("Warning: All gaussians have been removed after reset_opacity_nonvisible")
                         return False
@@ -626,7 +599,7 @@ class BackEnd(mp.Process):
         # --- DEBUG: map结束时高斯点状态 ---
         cur_shape = self.gaussians.get_xyz.shape if self.gaussians is not None and hasattr(self.gaussians, "get_xyz") and self.gaussians.get_xyz is not None else None
         if cur_shape != self._last_gaussian_shape:
-            Log(f"[DEBUG] map end: gaussians.get_xyz shape: {cur_shape}")
+            #Log(f"[DEBUG] map end: gaussians.get_xyz shape: {cur_shape}")
             self._last_gaussian_shape = cur_shape
         return gaussian_split
 
@@ -724,7 +697,7 @@ class BackEnd(mp.Process):
                     viewpoint = data[2]
                     current_window = data[3]
                     depth_map = data[4]
-                    spring_model = data[5]  # 获取弹簧模型
+                    spring_model = data[5]
 
                     self.viewpoints[cur_frame_idx] = viewpoint
                     self.current_window = current_window
@@ -733,6 +706,10 @@ class BackEnd(mp.Process):
                     # 存储弹簧模型和锚点
                     self.spring_models[cur_frame_idx] = spring_model
                     self.anchor_points[cur_frame_idx] = spring_model.anchor_points
+                    self.anchor_indices[cur_frame_idx] = spring_model.anchor_indices
+                    self.anchor_features_dc[cur_frame_idx] = spring_model.anchor_features_dc
+                    self.anchor_features_rest[cur_frame_idx] = spring_model.anchor_features_rest
+                    self.anchor_opacity[cur_frame_idx] = spring_model.anchor_opacity
 
                     opt_params = []
                     frames_to_optimize = self.config["Training"]["pose_window"]

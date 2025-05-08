@@ -173,3 +173,9 @@ class ParamsGUI:
         self.gaussians = gaussians
         self.q_main2vis = q_main2vis
         self.q_vis2main = q_vis2main
+
+
+def visualize_anchors(anchor_points):
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(anchor_points.cpu().numpy())
+    o3d.visualization.draw_geometries([pcd])

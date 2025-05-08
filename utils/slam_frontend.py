@@ -18,8 +18,12 @@ from utils.pose_utils import update_pose
 from utils.slam_utils import get_loss_tracking, get_median_depth
 
 class SpringModel:
-    def __init__(self, anchor_points, k_neighbors=8):
+    def __init__(self, anchor_points, anchor_indices, anchor_features_dc, anchor_features_rest, anchor_opacity, k_neighbors=8):
         self.anchor_points = anchor_points
+        self.anchor_indices = anchor_indices.long()
+        self.anchor_features_dc = anchor_features_dc
+        self.anchor_features_rest = anchor_features_rest
+        self.anchor_opacity = anchor_opacity
         self.k_neighbors = k_neighbors
         self.device = anchor_points.device
         self.n_points = anchor_points.shape[0]
@@ -37,7 +41,7 @@ class SpringModel:
             raise ValueError("Input tensors cannot be None")
             
         # 打印输入张量的形状以便调试
-        Log(f"Input tensor shapes - x: {x.shape}, ref: {ref.shape}")
+        #Log(f"Input tensor shapes - x: {x.shape}, ref: {ref.shape}")
         
         # 确保输入张量至少是2维的
         if x.dim() == 1:
@@ -177,28 +181,28 @@ class FrontEnd(mp.Process):
             # 如果点数少于要求的锚点数，直接返回所有点
             if gaussian_points.shape[0] <= n_anchors:
                 Log(f"Using all {gaussian_points.shape[0]} points as anchors")
-                return gaussian_points
+                anchor_indices = torch.arange(gaussian_points.shape[0], device=self.device, dtype=torch.long)
+                anchor_points = gaussian_points
+            else:
+                anchor_points = torch.zeros((n_anchors, 3), device=self.device)
+                anchor_indices = torch.zeros(n_anchors, dtype=torch.long, device=self.device)
+                first_idx = torch.randint(gaussian_points.shape[0], (1,), device=self.device)
+                anchor_points[0] = gaussian_points[first_idx]
+                anchor_indices[0] = first_idx
+                distances = torch.norm(gaussian_points - anchor_points[0].unsqueeze(0), dim=1)
+                for i in range(1, n_anchors):
+                    idx = torch.argmax(distances)
+                    anchor_points[i] = gaussian_points[idx]
+                    anchor_indices[i] = idx
+                    new_dists = torch.norm(gaussian_points - anchor_points[i].unsqueeze(0), dim=1)
+                    distances = torch.min(distances, new_dists)
+            anchor_indices = anchor_indices.long()
+            anchor_features_dc = self.gaussians._features_dc[anchor_indices]
+            anchor_features_rest = self.gaussians._features_rest[anchor_indices]
+            anchor_opacity = self.gaussians._opacity[anchor_indices]
 
-            # 使用FPS (Farthest Point Sampling) 进行采样
-            anchor_points = torch.zeros((n_anchors, 3), device=self.device)
-            # 随机选择第一个点
-            first_idx = torch.randint(gaussian_points.shape[0], (1,))
-            anchor_points[0] = gaussian_points[first_idx]
-
-            # 计算到已选择点的最短距离
-            distances = torch.norm(gaussian_points - anchor_points[0].unsqueeze(0), dim=1)
-
-            # 选择剩余的点
-            for i in range(1, n_anchors):
-                # 选择距离最大的点作为下一个锚点
-                idx = torch.argmax(distances)
-                anchor_points[i] = gaussian_points[idx]
-                # 更新距离
-                new_dists = torch.norm(gaussian_points - anchor_points[i].unsqueeze(0), dim=1)
-                distances = torch.min(distances, new_dists)
-
-            Log(f"Successfully generated {n_anchors} anchor points")
-            return anchor_points
+            Log(f"Successfully generated {anchor_points.shape[0]} anchor points")
+            return anchor_points, anchor_indices, anchor_features_dc, anchor_features_rest, anchor_opacity
 
         except Exception as e:
             Log(f"Error in generate_anchor_points: {str(e)}")
@@ -269,10 +273,10 @@ class FrontEnd(mp.Process):
         # 生成锚点并创建弹簧模型
         if gaussian_points is not None and gaussian_points.numel() > 0:
             try:
-                anchor_points = self.generate_anchor_points(gaussian_points)
+                anchor_points, anchor_indices, anchor_features_dc, anchor_features_rest, anchor_opacity = self.generate_anchor_points(gaussian_points)
                 if anchor_points is not None:
                     self.anchor_points[cur_frame_idx] = anchor_points
-                    self.spring_models[cur_frame_idx] = SpringModel(anchor_points, self.k_neighbors)
+                    self.spring_models[cur_frame_idx] = SpringModel(anchor_points, anchor_indices, anchor_features_dc, anchor_features_rest, anchor_opacity, self.k_neighbors)
                 else:
                     Log(f"Warning: Failed to generate anchor points for frame {cur_frame_idx}")
                     self.anchor_points[cur_frame_idx] = None
@@ -479,6 +483,11 @@ class FrontEnd(mp.Process):
         dist_check = dist > kf_translation * self.median_depth
         dist_check2 = dist > kf_min_translation * self.median_depth
 
+        # 修复：判断可见性mask shape是否一致
+        if cur_frame_visibility_filter.shape != occ_aware_visibility[last_keyframe_idx].shape:
+            #Log(f"[WARN] Visibility filter shape mismatch: {cur_frame_visibility_filter.shape} vs {occ_aware_visibility[last_keyframe_idx].shape}, skip this keyframe check.")
+            return False
+
         union = torch.logical_or(
             cur_frame_visibility_filter, occ_aware_visibility[last_keyframe_idx]
         ).count_nonzero()
@@ -500,6 +509,10 @@ class FrontEnd(mp.Process):
         for i in range(N_dont_touch, len(window)):
             kf_idx = window[i]
             # szymkiewicz–simpson coefficient
+            # 修复：判断可见性mask shape是否一致
+            if cur_frame_visibility_filter.shape != occ_aware_visibility[kf_idx].shape:
+                #Log(f"[WARN] Visibility filter shape mismatch in window: {cur_frame_visibility_filter.shape} vs {occ_aware_visibility[kf_idx].shape}, skip this window check.")
+                continue
             intersection = torch.logical_and(
                 cur_frame_visibility_filter, occ_aware_visibility[kf_idx]
             ).count_nonzero()
@@ -509,9 +522,7 @@ class FrontEnd(mp.Process):
             )
             point_ratio_2 = intersection / denom
             cut_off = (
-                self.config["Training"]["kf_cutoff"]
-                if "kf_cutoff" in self.config["Training"]
-                else 0.4
+                self.config["Training"].get("kf_cutoff", 0.4)
             )
             if not self.initialized:
                 cut_off = 0.4
@@ -599,6 +610,8 @@ class FrontEnd(mp.Process):
         tic = torch.cuda.Event(enable_timing=True)
         toc = torch.cuda.Event(enable_timing=True)
 
+        # 新增：避免after prune_points重复输出
+        last_shape = None
         while True:
             if self.q_vis2main.empty():
                 if self.pause:
@@ -764,6 +777,12 @@ class FrontEnd(mp.Process):
                     # throttle at 3fps when keyframe is added
                     duration = tic.elapsed_time(toc)
                     time.sleep(max(0.01, 1.0 / 3.0 - duration / 1000))
+
+                # 在合适位置替换所有Log(f"after prune_points: gaussians.get_xyz shape: ...")为：
+                cur_shape = self.gaussians.get_xyz.shape if self.gaussians is not None and hasattr(self.gaussians, "get_xyz") and self.gaussians.get_xyz is not None else None
+                if cur_shape != last_shape:
+                    #Log(f"after prune_points: gaussians.get_xyz shape: {cur_shape}")
+                    last_shape = cur_shape
             else:
                 data = self.frontend_queue.get()
                 if data[0] == "sync_backend":
