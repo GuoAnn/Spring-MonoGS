@@ -12,6 +12,7 @@ from utils.logging_utils import Log
 from utils.multiprocessing_utils import clone_obj
 from utils.pose_utils import update_pose
 from utils.slam_utils import get_loss_mapping
+from utils.gaussian_interpolation import interpolate_gaussian
 
 
 class BackEnd(mp.Process):
@@ -53,6 +54,12 @@ class BackEnd(mp.Process):
         self.dt = config["Training"]["spring_model"].get("dt", 0.01)  # 时间步长
         self.n_iters = config["Training"]["spring_model"].get("n_iters", 10)  # 迭代次数
 
+        self.warned_frames = set()
+        self.mapping_error_logged = set()
+        self.invalid_gaussian_logged = False
+
+        self._last_gaussian_shape = None
+
     def set_hyperparams(self):
         self.save_results = self.config["Results"]["save_results"]
 
@@ -83,6 +90,7 @@ class BackEnd(mp.Process):
         self.gaussians.extend_from_pcd_seq(
             viewpoint, kf_id=frame_idx, init=init, scale=scale, depthmap=depth_map
         )
+        Log(f"[DEBUG] after add_next_kf: gaussians.get_xyz shape: {self.gaussians.get_xyz.shape if self.gaussians.get_xyz is not None else 'None'}")
 
     def reset(self):
         self.iteration_count = 0
@@ -94,6 +102,7 @@ class BackEnd(mp.Process):
 
         # remove all gaussians
         self.gaussians.prune_points(self.gaussians.unique_kfIDs >= 0)
+        Log(f"[DEBUG] after reset: gaussians.get_xyz shape: {self.gaussians.get_xyz.shape if self.gaussians.get_xyz is not None else 'None'}")
         # remove everything from the queues
         while not self.backend_queue.empty():
             self.backend_queue.get()
@@ -171,110 +180,206 @@ class BackEnd(mp.Process):
 
     def generate_anchor_points(self, gaussian_points):
         """从高斯点中生成锚点"""
-        n_anchors = self.config["Training"]["spring_model"]["n_anchors"]
-        device = gaussian_points.device
-        
-        # 如果高斯点数量少于要求的锚点数，直接使用所有高斯点
-        if gaussian_points.shape[0] <= n_anchors:
-            return gaussian_points
-        
-        # 计算点云边界框
-        min_coords = torch.min(gaussian_points, dim=0)[0]
-        max_coords = torch.max(gaussian_points, dim=0)[0]
-        
-        # 在边界框内随机采样点
-        anchor_points = torch.rand(n_anchors, 3, device=device)
-        anchor_points = anchor_points * (max_coords - min_coords) + min_coords
-        
-        # 找到每个锚点的最近高斯点
-        from pytorch3d.ops import knn_points
-        _, knn_idx, _ = knn_points(anchor_points.unsqueeze(0), gaussian_points.unsqueeze(0), K=1)
-        anchor_points = gaussian_points[knn_idx.squeeze(0).squeeze(1)]
-        
-        return anchor_points
+        try:
+            n_anchors = self.config["Training"]["spring_model"]["n_anchors"]
+            if gaussian_points is None:
+                Log("Warning: gaussian_points is None")
+                return None
+
+            if not isinstance(gaussian_points, torch.Tensor):
+                Log("Warning: gaussian_points is not a torch.Tensor")
+                return None
+
+            if gaussian_points.dim() == 1:
+                gaussian_points = gaussian_points.view(-1, 3)
+            elif gaussian_points.dim() == 3:
+                gaussian_points = gaussian_points.squeeze(0)
+
+            gaussian_points = gaussian_points.to(self.device)
+
+            Log(f"Generating anchor points from {gaussian_points.shape[0]} gaussian points")
+
+            if gaussian_points.shape[0] <= n_anchors:
+                Log(f"Using all {gaussian_points.shape[0]} points as anchors")
+                return gaussian_points
+
+            anchor_points = torch.zeros((n_anchors, 3), device=self.device)
+            first_idx = torch.randint(gaussian_points.shape[0], (1,))
+            anchor_points[0] = gaussian_points[first_idx]
+            distances = torch.norm(gaussian_points - anchor_points[0].unsqueeze(0), dim=1)
+            for i in range(1, n_anchors):
+                idx = torch.argmax(distances)
+                anchor_points[i] = gaussian_points[idx]
+                new_dists = torch.norm(gaussian_points - anchor_points[i].unsqueeze(0), dim=1)
+                distances = torch.min(distances, new_dists)
+            Log(f"Successfully generated {n_anchors} anchor points")
+            return anchor_points
+        except Exception as e:
+            Log(f"Error in generate_anchor_points: {str(e)}")
+            return None
 
     def optimize_spring_model(self, current_window):
         """优化弹簧模型参数和锚点位置"""
-        if not self.spring_model_enabled:
-            return
+        try:
+            if not self.spring_model_enabled:
+                return
             
-        if len(current_window) < 2:
-            return
+            if len(current_window) < 2:
+                return
             
-        # 获取模板帧（第一帧）的锚点
-        template_idx = current_window[0]
-        if self.template_anchors is None and template_idx in self.anchor_points:
-            self.template_anchors = self.anchor_points[template_idx]
-            Log(f"Set template anchors from frame {template_idx}")
+            # 获取模板帧（第一帧）的锚点
+            template_idx = current_window[0]
+            if self.template_anchors is None and template_idx in self.anchor_points:
+                self.template_anchors = self.anchor_points[template_idx]
+                Log(f"Set template anchors from frame {template_idx}")
             
-        if self.template_anchors is None:
-            Log("Warning: No template anchors available")
-            return
+            if self.template_anchors is None:
+                Log("Warning: No template anchors available")
+                return
             
-        # 对每个非模板帧进行优化
-        for frame_idx in current_window[1:]:
-            if frame_idx not in self.anchor_points:
-                continue
+            # 对每个非模板帧进行优化
+            for frame_idx in current_window[1:]:
+                if frame_idx not in self.anchor_points:
+                    continue
                 
-            # 获取当前帧的锚点
-            current_anchors = self.anchor_points[frame_idx]
-            
-            # 初始化或获取速度
-            if frame_idx not in self.anchor_velocities:
-                self.anchor_velocities[frame_idx] = torch.zeros_like(current_anchors)
-            
-            # 计算形变能量和物理约束
-            for _ in range(self.n_iters):
-                # 计算弹簧力
-                delta_pos = current_anchors - self.template_anchors
-                dist = torch.norm(delta_pos, dim=1, keepdim=True)
-                force = -self.spring_k * delta_pos  # 弹簧力
+                # 获取当前帧的锚点
+                current_anchors = self.anchor_points[frame_idx]
+                if current_anchors is None:
+                    Log(f"Warning: anchor_points for frame {frame_idx} is None, skip spring optimization.")
+                    continue
                 
-                # 添加阻尼力
-                velocity = self.anchor_velocities[frame_idx]
-                damping_force = -self.damping * velocity
+                # 初始化或获取速度
+                if frame_idx not in self.anchor_velocities:
+                    self.anchor_velocities[frame_idx] = torch.zeros_like(current_anchors)
                 
-                # 合力
-                total_force = force + damping_force
+                # 计算形变能量和物理约束
+                for _ in range(self.n_iters):
+                    # 计算弹簧力
+                    delta_pos = current_anchors - self.template_anchors
+                    dist = torch.norm(delta_pos, dim=1, keepdim=True)
+                    force = -self.spring_k * delta_pos  # 弹簧力
+                    
+                    # 添加阻尼力
+                    velocity = self.anchor_velocities[frame_idx]
+                    damping_force = -self.damping * velocity
+                    
+                    # 合力
+                    total_force = force + damping_force
+                    
+                    # 更新速度和位置
+                    self.anchor_velocities[frame_idx] = velocity + total_force * self.dt
+                    current_anchors = current_anchors + self.anchor_velocities[frame_idx] * self.dt
                 
-                # 更新速度和位置
-                self.anchor_velocities[frame_idx] = velocity + total_force * self.dt
-                current_anchors = current_anchors + self.anchor_velocities[frame_idx] * self.dt
-            
-            # 更新锚点位置
-            self.anchor_points[frame_idx] = current_anchors
-            
-            # 使用锚点位置更新高斯点（每个关键帧只更新一次）
-            if self.gaussians.get_xyz is not None:
-                gaussian_points = self.gaussians.get_xyz
-                if gaussian_points.numel() > 0:
-                    updated_positions = self.interpolate_gaussians(
-                        current_anchors,
-                        gaussian_points,
-                        current_anchors - self.template_anchors
-                    )
-                    # 使用正确的方式更新高斯点位置
-                    self.gaussians._xyz.data.copy_(updated_positions)
-                    # 只在第一次更新时输出日志
-                    if not hasattr(self, '_updated_frame_' + str(frame_idx)):
-                        Log(f"Updated gaussian points for frame {frame_idx}")
-                        setattr(self, '_updated_frame_' + str(frame_idx), True)
+                # 更新锚点位置
+                self.anchor_points[frame_idx] = current_anchors
+                
+                # 使用锚点位置更新高斯点（每个关键帧只更新一次）
+                if self.gaussians.get_xyz is not None:
+                    gaussian_points = self.gaussians.get_xyz
+                    if gaussian_points.numel() > 0:
+                        updated_positions = self.interpolate_gaussians(
+                            current_anchors,
+                            gaussian_points,
+                            current_anchors - self.template_anchors
+                        )
+                        # 检查插值结果有效性
+                        if torch.isnan(updated_positions).any() or torch.isinf(updated_positions).any():
+                            Log("Warning: Invalid positions detected, skipping gaussian update for this frame.")
+                            continue
+                        self.gaussians._xyz.data.copy_(updated_positions)
+                        if not hasattr(self, '_updated_frame_' + str(frame_idx)):
+                            setattr(self, '_updated_frame_' + str(frame_idx), True)
+                            Log(f"Updated gaussian points for frame {frame_idx}")
+
+        except Exception as e:
+            Log(f"Spring model error: {e}")
+            # 不提前return，保证主流程继续
 
     def interpolate_gaussians(self, anchor_points, gaussian_points, anchor_deltas):
-        """使用IDW插值更新高斯点位置"""
-        # 计算每个高斯点到锚点的距离
-        dist = torch.cdist(gaussian_points, anchor_points)
-        weights = 1.0 / (dist + 1e-6)
-        weights = weights / weights.sum(dim=1, keepdim=True)
-        
-        # 计算高斯点的位移
-        gaussian_deltas = torch.matmul(weights, anchor_deltas)
-        
-        return gaussian_points + gaussian_deltas
+        """
+        使用IDW插值更新高斯点所有属性
+        """
+        from pytorch3d.ops import knn_points
+        K_BINDING = min(16, anchor_points.shape[0])
+        dist, idx, _ = knn_points(gaussian_points.unsqueeze(0), anchor_points.unsqueeze(0), K=K_BINDING)
+        dist = dist.squeeze(0)  # [N, K]
+        idx = idx.squeeze(0)    # [N, K]
+
+        # 数值稳定性：距离不能为0
+        dist = torch.clamp(dist, min=1e-6)
+        eps = 1e-14
+        weights = 1.0 / (dist.sqrt() + eps)  # [N, K]
+        weights = weights / (weights.sum(dim=1, keepdim=True) + eps)  # 归一化
+
+        # 获取所有高斯点属性
+        # 以self.gaussians为例，假设有get_xyz, get_opacity, get_scaling, get_rotation, get_features等
+        N = gaussian_points.shape[0]
+        new_attrs = {}
+
+        # 1. 位置
+        anchor_xyz = anchor_points  # [M, 3]
+        anchor_deltas_knn = anchor_deltas[idx]  # [N, K, 3]
+        delta_gaussians = (anchor_deltas_knn * weights.unsqueeze(-1)).sum(dim=1)  # [N, 3]
+        new_xyz = gaussian_points + delta_gaussians
+        new_attrs['xyz'] = new_xyz
+
+        # 2. 颜色（SH特征）
+        anchor_features_dc = self.gaussians._features_dc[idx]  # [N, K, ...]
+        anchor_features_rest = self.gaussians._features_rest[idx]  # [N, K, ...]
+        new_features_dc = (anchor_features_dc * weights.unsqueeze(-1).unsqueeze(-1)).sum(dim=1)
+        new_features_rest = (anchor_features_rest * weights.unsqueeze(-1).unsqueeze(-1)).sum(dim=1)
+        new_attrs['features_dc'] = new_features_dc
+        new_attrs['features_rest'] = new_features_rest
+
+        # 3. 不透明度
+        anchor_opacity = self.gaussians._opacity[idx]  # [N, K, 1]
+        new_opacity = (anchor_opacity * weights.unsqueeze(-1)).sum(dim=1)
+        new_attrs['opacity'] = new_opacity
+
+        # 4. 尺度
+        anchor_scaling = self.gaussians._scaling[idx]  # [N, K, ...]
+        new_scaling = (anchor_scaling * weights.unsqueeze(-1)).sum(dim=1)
+        new_attrs['scaling'] = new_scaling
+
+        # 5. 旋转（如有，建议用四元数slerp插值，否则线性插值）
+        anchor_rotation = self.gaussians._rotation[idx]  # [N, K, ...]
+        new_rotation = (anchor_rotation * weights.unsqueeze(-1)).sum(dim=1)
+        new_attrs['rotation'] = new_rotation
+
+        # 检查插值结果
+        for k, v in new_attrs.items():
+            if torch.isnan(v).any() or torch.isinf(v).any():
+                Log(f"Warning: Invalid {k} detected in interpolated gaussian points, skipping update.")
+                return getattr(self.gaussians, f"_{k}").data  # 返回原始点，避免污染
+
+        # 批量更新self.gaussians的所有属性
+        self.gaussians._xyz.data.copy_(new_attrs['xyz'])
+        self.gaussians._features_dc.data.copy_(new_attrs['features_dc'])
+        self.gaussians._features_rest.data.copy_(new_attrs['features_rest'])
+        self.gaussians._opacity.data.copy_(new_attrs['opacity'])
+        self.gaussians._scaling.data.copy_(new_attrs['scaling'])
+        self.gaussians._rotation.data.copy_(new_attrs['rotation'])
+
+        return new_attrs['xyz']  # 兼容原有调用
 
     def map(self, current_window, prune=False, iters=1):
+        # --- DEBUG: map开始时高斯点状态 ---
+        cur_shape = self.gaussians.get_xyz.shape if self.gaussians is not None and hasattr(self.gaussians, "get_xyz") and self.gaussians.get_xyz is not None else None
+        if cur_shape != self._last_gaussian_shape:
+            Log(f"[DEBUG] map start: gaussians.get_xyz shape: {cur_shape}")
+            self._last_gaussian_shape = cur_shape
+        
         if len(current_window) == 0:
             return
+
+        # 检查高斯点状态
+        if self.gaussians is None or self.gaussians.get_xyz is None or self.gaussians.get_xyz.numel() == 0:
+            if not self.invalid_gaussian_logged:
+                Log("Error: Invalid gaussians state")
+                self.invalid_gaussian_logged = True
+            return False
+        else:
+            self.invalid_gaussian_logged = False  # 恢复
 
         # 在进入建图模块前优化弹簧模型
         self.optimize_spring_model(current_window)
@@ -289,6 +394,9 @@ class BackEnd(mp.Process):
                 continue
             random_viewpoint_stack.append(viewpoint)
 
+        # 记录已经警告过的帧
+        warned_frames = set()
+
         for _ in range(iters):
             self.iteration_count += 1
             self.last_sent += 1
@@ -301,72 +409,107 @@ class BackEnd(mp.Process):
 
             keyframes_opt = []
 
-            for cam_idx in range(len(current_window)):
-                viewpoint = viewpoint_stack[cam_idx]
-                keyframes_opt.append(viewpoint)
-                render_pkg = render(
-                    viewpoint, self.gaussians, self.pipeline_params, self.background
-                )
-                (
-                    image,
-                    viewspace_point_tensor,
-                    visibility_filter,
-                    radii,
-                    depth,
-                    opacity,
-                    n_touched,
-                ) = (
-                    render_pkg["render"],
-                    render_pkg["viewspace_points"],
-                    render_pkg["visibility_filter"],
-                    render_pkg["radii"],
-                    render_pkg["depth"],
-                    render_pkg["opacity"],
-                    render_pkg["n_touched"],
-                )
+            try:
+                for cam_idx in range(len(current_window)):
+                    viewpoint = viewpoint_stack[cam_idx]
+                    frame_idx = current_window[cam_idx]
+                    keyframes_opt.append(viewpoint)
+                    
+                    # 检查viewpoint状态
+                    if not hasattr(viewpoint, 'R') or not hasattr(viewpoint, 'T'):
+                        if frame_idx not in warned_frames:
+                            Log(f"Error: Invalid viewpoint state for frame {frame_idx}")
+                            warned_frames.add(frame_idx)
+                        continue
+                        
+                    render_pkg = render(
+                        viewpoint, self.gaussians, self.pipeline_params, self.background
+                    )
+                    
+                    # 检查render_pkg是否为None
+                    if render_pkg is None:
+                        if frame_idx not in warned_frames:
+                            Log(f"Warning: render_pkg is None for frame {frame_idx}")
+                            warned_frames.add(frame_idx)
+                        continue
+                        
+                    (
+                        image,
+                        viewspace_point_tensor,
+                        visibility_filter,
+                        radii,
+                        depth,
+                        opacity,
+                        n_touched,
+                    ) = (
+                        render_pkg["render"],
+                        render_pkg["viewspace_points"],
+                        render_pkg["visibility_filter"],
+                        render_pkg["radii"],
+                        render_pkg["depth"],
+                        render_pkg["opacity"],
+                        render_pkg["n_touched"],
+                    )
 
-                loss_mapping += get_loss_mapping(
-                    self.config, image, depth, viewpoint, opacity
-                )
-                viewspace_point_tensor_acm.append(viewspace_point_tensor)
-                visibility_filter_acm.append(visibility_filter)
-                radii_acm.append(radii)
-                n_touched_acm.append(n_touched)
+                    loss_mapping += get_loss_mapping(
+                        self.config, image, depth, viewpoint, opacity
+                    )
+                    viewspace_point_tensor_acm.append(viewspace_point_tensor)
+                    visibility_filter_acm.append(visibility_filter)
+                    radii_acm.append(radii)
+                    n_touched_acm.append(n_touched)
 
-            for cam_idx in torch.randperm(len(random_viewpoint_stack))[:2]:
-                viewpoint = random_viewpoint_stack[cam_idx]
-                render_pkg = render(
-                    viewpoint, self.gaussians, self.pipeline_params, self.background
-                )
-                (
-                    image,
-                    viewspace_point_tensor,
-                    visibility_filter,
-                    radii,
-                    depth,
-                    opacity,
-                    n_touched,
-                ) = (
-                    render_pkg["render"],
-                    render_pkg["viewspace_points"],
-                    render_pkg["visibility_filter"],
-                    render_pkg["radii"],
-                    render_pkg["depth"],
-                    render_pkg["opacity"],
-                    render_pkg["n_touched"],
-                )
-                loss_mapping += get_loss_mapping(
-                    self.config, image, depth, viewpoint, opacity
-                )
-                viewspace_point_tensor_acm.append(viewspace_point_tensor)
-                visibility_filter_acm.append(visibility_filter)
-                radii_acm.append(radii)
+                for cam_idx in torch.randperm(len(random_viewpoint_stack))[:2]:
+                    viewpoint = random_viewpoint_stack[cam_idx]
+                    render_pkg = render(
+                        viewpoint, self.gaussians, self.pipeline_params, self.background
+                    )
+                    
+                    # 检查render_pkg是否为None
+                    if render_pkg is None:
+                        continue
+                        
+                    (
+                        image,
+                        viewspace_point_tensor,
+                        visibility_filter,
+                        radii,
+                        depth,
+                        opacity,
+                        n_touched,
+                    ) = (
+                        render_pkg["render"],
+                        render_pkg["viewspace_points"],
+                        render_pkg["visibility_filter"],
+                        render_pkg["radii"],
+                        render_pkg["depth"],
+                        render_pkg["opacity"],
+                        render_pkg["n_touched"],
+                    )
+                    loss_mapping += get_loss_mapping(
+                        self.config, image, depth, viewpoint, opacity
+                    )
+                    viewspace_point_tensor_acm.append(viewspace_point_tensor)
+                    visibility_filter_acm.append(visibility_filter)
+                    radii_acm.append(radii)
 
-            scaling = self.gaussians.get_scaling
-            isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1))
-            loss_mapping += 10 * isotropic_loss.mean()
-            loss_mapping.backward()
-            gaussian_split = False
+                    if len(viewspace_point_tensor_acm) == 0:
+                        if self.iteration_count % 100 == 0:  # 降低警告频率
+                            Log("Warning: No valid frames rendered in this iteration")
+                        return False
+
+                scaling = self.gaussians.get_scaling
+                isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1))
+                loss_mapping += 10 * isotropic_loss.mean()
+                loss_mapping.backward()
+                gaussian_split = False
+                
+            except Exception as e:
+                err_str = str(e)
+                if err_str not in self.mapping_error_logged:
+                    Log(f"Error in mapping: {err_str}")
+                    self.mapping_error_logged.add(err_str)
+                return False
             
             with torch.no_grad():
                 self.occ_aware_visibility = {}
@@ -380,6 +523,9 @@ class BackEnd(mp.Process):
                         prune_mode = self.config["Training"]["prune_mode"]
                         prune_coviz = 3
                         self.gaussians.n_obs.fill_(0)
+                        if not hasattr(self, '_n_obs_initialized') or not self._n_obs_initialized:
+                            self.gaussians.n_obs.fill_(0)
+                            self._n_obs_initialized = True
                         for window_idx, visibility in self.occ_aware_visibility.items():
                             self.gaussians.n_obs += visibility.cpu()
                         to_prune = None
@@ -395,11 +541,14 @@ class BackEnd(mp.Process):
                             )
                         if to_prune is not None and self.monocular:
                             self.gaussians.prune_points(to_prune.cuda())
-                            for idx in range((len(current_window))):
-                                current_idx = current_window[idx]
-                                self.occ_aware_visibility[current_idx] = (
-                                    self.occ_aware_visibility[current_idx][~to_prune]
-                                )
+                            # DEBUG: prune_points后高斯点状态
+                            if self.gaussians.get_xyz is not None:
+                                Log(f"[DEBUG] after prune_points: gaussians.get_xyz shape: {self.gaussians.get_xyz.shape}")
+                            else:
+                                Log("[DEBUG] after prune_points: gaussians.get_xyz is None")
+                            if self.gaussians.get_xyz is None or self.gaussians.get_xyz.numel() == 0:
+                                Log("Warning: All gaussians have been pruned! Restoring at least one point.")
+                                return False
                         if not self.initialized:
                             self.initialized = True
                             Log("Initialized SLAM")
@@ -419,19 +568,46 @@ class BackEnd(mp.Process):
                     == self.gaussian_update_offset
                 )
                 if update_gaussian:
-                    self.gaussians.densify_and_prune(
-                        self.opt_params.densify_grad_threshold,
-                        self.gaussian_th,
-                        self.gaussian_extent,
-                        self.size_threshold,
-                    )
+                    if self.gaussians.get_xyz is not None and self.gaussians.get_xyz.shape[0] <= 100:
+                        Log("Warning: Too few gaussians, skip densify_and_prune to avoid deleting all points.")
+                    else:
+                        self.gaussians.densify_and_prune(
+                            self.opt_params.densify_grad_threshold,
+                            self.gaussian_th,
+                            self.gaussian_extent,
+                            self.size_threshold,
+                        )
+                        # DEBUG: densify_and_prune后高斯点状态
+                        if self.gaussians.get_xyz is not None:
+                            Log(f"[DEBUG] after densify_and_prune: gaussians.get_xyz shape: {self.gaussians.get_xyz.shape}")
+                            if self.gaussians.get_xyz.shape[0] == 0:
+                                Log("Warning: All gaussians have been pruned by densify_and_prune! Skipping this prune.")
+                                return False
+                        else:
+                            Log("[DEBUG] after densify_and_prune: gaussians.get_xyz is None")
+                            return False
                     gaussian_split = True
 
                 if (self.iteration_count % self.gaussian_reset) == 0 and (
                     not update_gaussian
                 ):
                     Log("Resetting the opacity of non-visible Gaussians")
-                    self.gaussians.reset_opacity_nonvisible(visibility_filter_acm)
+                    # 合并所有frame的可见性mask
+                    if isinstance(visibility_filter_acm, list):
+                        global_visibility = torch.zeros_like(self.gaussians.get_xyz[:, 0], dtype=torch.bool)
+                        for vf in visibility_filter_acm:
+                            global_visibility |= vf
+                        self.gaussians.reset_opacity_nonvisible(global_visibility)
+                    else:
+                        self.gaussians.reset_opacity_nonvisible(visibility_filter_acm)
+                    # DEBUG: reset_opacity_nonvisible后高斯点状态
+                    if self.gaussians.get_xyz is not None:
+                        Log(f"[DEBUG] after reset_opacity_nonvisible: gaussians.get_xyz shape: {self.gaussians.get_xyz.shape}")
+                    else:
+                        Log("[DEBUG] after reset_opacity_nonvisible: gaussians.get_xyz is None")
+                    if self.gaussians.get_xyz is None or self.gaussians.get_xyz.numel() == 0:
+                        Log("Warning: All gaussians have been removed after reset_opacity_nonvisible")
+                        return False
                     gaussian_split = True
 
                 self.gaussians.optimizer.step()
@@ -447,6 +623,11 @@ class BackEnd(mp.Process):
                     if viewpoint.uid == 0:
                         continue
                     update_pose(viewpoint)
+        # --- DEBUG: map结束时高斯点状态 ---
+        cur_shape = self.gaussians.get_xyz.shape if self.gaussians is not None and hasattr(self.gaussians, "get_xyz") and self.gaussians.get_xyz is not None else None
+        if cur_shape != self._last_gaussian_shape:
+            Log(f"[DEBUG] map end: gaussians.get_xyz shape: {cur_shape}")
+            self._last_gaussian_shape = cur_shape
         return gaussian_split
 
     def color_refinement(self):

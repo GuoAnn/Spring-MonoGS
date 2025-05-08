@@ -126,7 +126,8 @@ class FrontEnd(mp.Process):
         self.spring_models = {}  # 存储每个关键帧的弹簧模型
         self.anchor_points = {}  # 存储每个关键帧的锚点
         self.k_neighbors = 8  # 弹簧连接的近邻点数量
-        self.n_anchors = 1000  # 每个关键帧的锚点数量
+        n_anchors = self.config["Training"]["spring_model"]["n_anchors"]
+        self.n_anchors = n_anchors  # 每个关键帧的锚点数量
         
         # 确保 CUDA 在子进程中正确初始化
         torch.cuda.set_device(self.device)
@@ -152,57 +153,53 @@ class FrontEnd(mp.Process):
     def generate_anchor_points(self, gaussian_points):
         """从高斯点中生成锚点"""
         try:
+            n_anchors = self.config["Training"]["spring_model"]["n_anchors"]
             # 确保输入是有效的张量
             if gaussian_points is None:
                 Log("Warning: gaussian_points is None")
                 return None
-                
+
             if not isinstance(gaussian_points, torch.Tensor):
                 Log("Warning: gaussian_points is not a torch.Tensor")
                 return None
-                
+
             # 确保点云维度正确
             if gaussian_points.dim() == 1:
                 gaussian_points = gaussian_points.view(-1, 3)
             elif gaussian_points.dim() == 3:
                 gaussian_points = gaussian_points.squeeze(0)
-                
+
             # 确保张量在正确的设备上
             gaussian_points = gaussian_points.to(self.device)
-            
+
             Log(f"Generating anchor points from {gaussian_points.shape[0]} gaussian points")
-            
+
             # 如果点数少于要求的锚点数，直接返回所有点
-            if gaussian_points.shape[0] <= self.n_anchors:
+            if gaussian_points.shape[0] <= n_anchors:
                 Log(f"Using all {gaussian_points.shape[0]} points as anchors")
                 return gaussian_points
-            
-            # 计算点云的边界框
-            min_coords = torch.min(gaussian_points, dim=0)[0]
-            max_coords = torch.max(gaussian_points, dim=0)[0]
-            
+
             # 使用FPS (Farthest Point Sampling) 进行采样
-            anchor_points = torch.zeros((self.n_anchors, 3), device=self.device)
+            anchor_points = torch.zeros((n_anchors, 3), device=self.device)
             # 随机选择第一个点
             first_idx = torch.randint(gaussian_points.shape[0], (1,))
             anchor_points[0] = gaussian_points[first_idx]
-            
+
             # 计算到已选择点的最短距离
             distances = torch.norm(gaussian_points - anchor_points[0].unsqueeze(0), dim=1)
-            
+
             # 选择剩余的点
-            for i in range(1, self.n_anchors):
+            for i in range(1, n_anchors):
                 # 选择距离最大的点作为下一个锚点
                 idx = torch.argmax(distances)
                 anchor_points[i] = gaussian_points[idx]
-                
                 # 更新距离
                 new_dists = torch.norm(gaussian_points - anchor_points[i].unsqueeze(0), dim=1)
                 distances = torch.min(distances, new_dists)
-            
-            Log(f"Successfully generated {self.n_anchors} anchor points")
+
+            Log(f"Successfully generated {n_anchors} anchor points")
             return anchor_points
-            
+
         except Exception as e:
             Log(f"Error in generate_anchor_points: {str(e)}")
             return None
@@ -362,6 +359,9 @@ class FrontEnd(mp.Process):
         render_pkg = render(
             viewpoint, self.gaussians, self.pipeline_params, self.background
         )
+        if render_pkg is None:
+            Log(f"Warning: render_pkg is None at frame {cur_frame_idx}, skip tracking.")
+            return None
         image, depth, opacity = (
             render_pkg["render"],
             render_pkg["depth"],
@@ -421,6 +421,9 @@ class FrontEnd(mp.Process):
             render_pkg = render(
                 viewpoint, self.gaussians, self.pipeline_params, self.background
             )
+            if render_pkg is None:
+                Log(f"Warning: render_pkg is None at frame {cur_frame_idx}, skip tracking.")
+                return None
             image, depth, opacity = (
                 render_pkg["render"],
                 render_pkg["depth"],
@@ -661,6 +664,10 @@ class FrontEnd(mp.Process):
                 else:
                     render_pkg = self.tracking(cur_frame_idx, viewpoint)
 
+                if render_pkg is None:
+                    Log(f"Warning: render_pkg is None at frame {cur_frame_idx}, skip tracking.")
+                    continue
+
                 current_window_dict = {}
                 current_window_dict[self.current_window[0]] = self.current_window[1:]
                 keyframes = [self.cameras[kf_idx] for kf_idx in self.current_window]
@@ -724,6 +731,15 @@ class FrontEnd(mp.Process):
                     self.request_keyframe(
                         cur_frame_idx, viewpoint, self.current_window, depth_map
                     )
+                    if self.save_results and self.save_trj and len(self.kf_indices) >= 3:
+                        Log("Evaluating ATE at frame: ", cur_frame_idx)
+                        eval_ate(
+                            self.cameras,
+                            self.kf_indices,
+                            self.save_dir,
+                            cur_frame_idx,
+                            monocular=self.monocular,
+                        )
                 else:
                     self.cleanup(cur_frame_idx)
                 cur_frame_idx += 1

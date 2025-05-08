@@ -31,6 +31,12 @@ def evaluate_evo(poses_gt, poses_est, plot_dir, label, monocular=False):
     traj_est = PosePath3D(poses_se3=poses_est)
     #print(f"traj_est: {traj_est.positions_xyz}")
     #print(f"traj_ref: {traj_ref.positions_xyz}")
+    if len(traj_est.positions_xyz) < 3 or len(traj_ref.positions_xyz) < 3:
+        Log("Warning: Too few trajectory points for ATE evaluation, skip this evaluation.")
+        return
+    if np.allclose(traj_est.positions_xyz, traj_est.positions_xyz[0]) or np.allclose(traj_ref.positions_xyz, traj_ref.positions_xyz[0]):
+        Log("Warning: Trajectory degenerate (all points identical), skip this evaluation.")
+        return
     traj_est_aligned = trajectory.align_trajectory(
         traj_est, traj_ref, correct_scale=monocular
     )
