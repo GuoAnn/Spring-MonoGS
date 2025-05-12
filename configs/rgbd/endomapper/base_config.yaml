@@ -1,5 +1,5 @@
 ## SLAM parameters
-Results: 
+Results:
   save_results: True
   save_dir: "results"
   save_trj: True
@@ -90,3 +90,7 @@ model_params:
 pipeline_params:
   convert_SHs_python: False
   compute_cov3D_python: False
+
+Logging:
+  level: "INFO"  # 可选: DEBUG, INFO, WARNING, ERROR
+  show_anchor_updates: False  # 是否显示锚点更新信息

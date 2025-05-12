@@ -134,6 +134,19 @@ class SLAM:
             q_vis2main=q_vis2main,
         )
 
+        # 新增：准备锚点和连线数据
+        anchor_points = []
+        spring_connections = []
+        if self.spring_model_enabled:
+            # 这里假设你有方法或数据可以获得锚点和连线，以下为示例
+            # anchor_points = [(x1, y1), (x2, y2), ...]
+            # spring_connections = [((x1, y1), (x2, y2)), ...]
+            # 你可以根据实际情况替换为真实数据
+            anchor_points = getattr(self.frontend, 'spring_anchors', [])
+            spring_connections = getattr(self.frontend, 'spring_connections', [])
+        self.params_gui.anchor_points = anchor_points
+        self.params_gui.spring_connections = spring_connections
+
         backend_process = mp.Process(target=self.backend.run)
         if self.use_gui:
             gui_process = mp.Process(target=slam_gui.run, args=(self.params_gui,))
@@ -173,6 +186,8 @@ class SLAM:
                 self.background,
                 kf_indices=kf_indices,
                 iteration="before_opt",
+                show_anchor=getattr(self, 'show_anchor', False),
+                anchor_points_dict=getattr(self.frontend, 'anchor_points', None),
             )
             columns = ["tag", "psnr", "ssim", "lpips", "RMSE ATE", "FPS"]
             metrics_table = wandb.Table(columns=columns)
@@ -208,6 +223,8 @@ class SLAM:
                 self.background,
                 kf_indices=kf_indices,
                 iteration="after_opt",
+                show_anchor=getattr(self, 'show_anchor', False),
+                anchor_points_dict=getattr(self.frontend, 'anchor_points', None),
             )
             metrics_table.add_data(
                 "After",
@@ -238,6 +255,7 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str)
     parser.add_argument("--eval", action="store_true")
     parser.add_argument("--gt_pose", action="store_true")
+    parser.add_argument("--show_anchor", action="store_true", help="在渲染图像中显示锚点和连线")
 
     args = parser.parse_args(sys.argv[1:])
 
@@ -293,7 +311,15 @@ if __name__ == "__main__":
 
     slam = SLAM(config, save_dir=save_dir)
 
+    # 传递show_anchor参数到eval_rendering
+    slam.show_anchor = args.show_anchor
+
     slam.run()
+
+    # 新增：保存第一帧锚点可视化图片
+    if args.show_anchor:
+        slam.frontend.save_first_frame_anchor_image(slam.dataset, slam.save_dir)
+
     wandb.finish()
 
     # All done
