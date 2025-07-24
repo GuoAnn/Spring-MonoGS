@@ -186,8 +186,6 @@ class SLAM:
                 self.background,
                 kf_indices=kf_indices,
                 iteration="before_opt",
-                show_anchor=getattr(self, 'show_anchor', False),
-                anchor_points_dict=getattr(self.frontend, 'anchor_points', None),
             )
             columns = ["tag", "psnr", "ssim", "lpips", "RMSE ATE", "FPS"]
             metrics_table = wandb.Table(columns=columns)
@@ -223,8 +221,6 @@ class SLAM:
                 self.background,
                 kf_indices=kf_indices,
                 iteration="after_opt",
-                show_anchor=getattr(self, 'show_anchor', False),
-                anchor_points_dict=getattr(self.frontend, 'anchor_points', None),
             )
             metrics_table.add_data(
                 "After",
@@ -247,6 +243,32 @@ class SLAM:
 
     def run(self):
         pass
+
+
+def try_init_wandb(config, tmp, current_datetime, timeout=30):
+    try:
+        run = wandb.init(
+            project="MonoGS",
+            name=f"{tmp}_{current_datetime}",
+            config=config,
+            mode=None if config["Results"]["use_wandb"] else "disabled",
+            settings=wandb.Settings(init_timeout=timeout)
+        )
+        return run
+    except wandb.errors.CommError as e:
+        Log(f"wandb连接超时({timeout}s)，自动切换为本地模式")
+        config["Results"]["use_wandb"] = False
+        run = wandb.init(
+            project="MonoGS",
+            name=f"{tmp}_{current_datetime}",
+            config=config,
+            mode="disabled"
+        )
+        return run
+    except Exception as e:
+        Log(f"wandb初始化失败: {e}")
+        config["Results"]["use_wandb"] = False
+        return None
 
 
 if __name__ == "__main__":
@@ -300,20 +322,14 @@ if __name__ == "__main__":
         with open(os.path.join(save_dir, "config.yml"), "w") as file:
             documents = yaml.dump(config, file)
         Log("saving results in " + save_dir)
-        run = wandb.init(
-            project="MonoGS",
-            name=f"{tmp}_{current_datetime}",
-            config=config,
-            mode=None if config["Results"]["use_wandb"] else "disabled",
-        )
-        wandb.define_metric("frame_idx")
-        wandb.define_metric("ate*", step_metric="frame_idx")
+        run = try_init_wandb(config, tmp, current_datetime, timeout=30)
+        if run is not None and config["Results"]["use_wandb"]:
+            wandb.define_metric("frame_idx")
+            wandb.define_metric("ate*", step_metric="frame_idx")
 
     slam = SLAM(config, save_dir=save_dir)
 
     # 传递show_anchor参数到eval_rendering
-    slam.show_anchor = args.show_anchor
-
     slam.run()
 
     # 新增：保存第一帧锚点可视化图片
