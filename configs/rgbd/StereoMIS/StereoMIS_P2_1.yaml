@@ -14,7 +14,7 @@ Dataset:
     k3: 0 #？
     width: 640
     height: 512
-    depth_scale: 100 #5000.0
+    depth_scale: 5 #5000.0
     distorted: False
 
 

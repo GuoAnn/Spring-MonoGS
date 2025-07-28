@@ -89,22 +89,13 @@ def get_loss_tracking_rgbd(
 
 
 def get_loss_mapping(config, image, depth, viewpoint, opacity, initialization=False):
-    # 原有损失计算
-    l1_loss = torch.abs(image - viewpoint.original_image).mean()
-    ssim_loss = 1.0 - ssim(image, viewpoint.original_image)
-    loss = (1.0 - config["lambda_dssim"]) * l1_loss + config["lambda_dssim"] * ssim_loss
-
-    # ===== 新增物理约束损失 =====
-    if gaussians is not None and "Spring" in config:
-        # 形变位移的L2正则化（确保梯度回传）
-        deformation = gaussians.deformation  # 从高斯模型获取形变参数
-        spring_loss = torch.mean(deformation.norm(dim=1))  # [N,3] -> [N] -> scalar
-        
-        # 从配置获取损失权重（默认0.2）
-        loss_weight = config["Spring"].get("loss_weight", 0.2)
-        loss += loss_weight * spring_loss
-
-    return loss
+    if initialization:
+        image_ab = image
+    else:
+        image_ab = (torch.exp(viewpoint.exposure_a)) * image + viewpoint.exposure_b
+    if config["Training"]["monocular"]:
+        return get_loss_mapping_rgb(config, image_ab, depth, viewpoint)
+    return get_loss_mapping_rgbd(config, image_ab, depth, viewpoint)
 
 
 def get_loss_mapping_rgb(config, image, depth, viewpoint):

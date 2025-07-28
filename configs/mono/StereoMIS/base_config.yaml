@@ -30,6 +30,7 @@ Training:
   gaussian_reset: 2001
   size_threshold: 20
   kf_interval: 5
+  force_kf_interval: 10
   window_size: 8
   pose_window: 3
   edge_threshold: 1.1
@@ -37,7 +38,7 @@ Training:
 
   kf_translation: 0.08
   kf_min_translation: 0.05
-  kf_overlap: 0.9 #0.8
+  kf_overlap: 0.96 #0.8
   kf_cutoff: 0.3
   prune_mode: 'slam'
   single_thread: False

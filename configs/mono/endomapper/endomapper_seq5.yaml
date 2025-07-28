@@ -1,7 +1,7 @@
 inherit_from: "configs/mono/endomapper/base_config.yaml"
 
 Dataset:
-  dataset_path: "/root/GS_datasets/datasets/endomapper/endomapper_seq1/"
+  dataset_path: "/root/GS_datasets/datasets/endomapper/endomapper_seq5/"
   Calibration:
     fx: 472.64955100886374 #391.886 第一个点的焦距，后面每一个其实都不一样，并且camera只给了一个值，这里先默认fx fy一样的值
     fy: 472.64955100886374 #391.886
