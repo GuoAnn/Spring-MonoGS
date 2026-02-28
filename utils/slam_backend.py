@@ -18,6 +18,7 @@ from utils.deformation_utils import (
     compute_volume_preservation_loss,
     compute_deformation_energy,
     compute_adaptive_stiffness,
+    compute_amap_loss,
 )
 
 
@@ -65,9 +66,12 @@ class BackEnd(mp.Process):
         self.dt = config["Training"]["spring_model"].get("dt", 0.01)  # 时间步长
         self.n_iterations = config["Training"]["spring_model"].get("n_iterations", 10)  # 迭代次数
 
-        # 形变正则化参数（ARAP + 体积保持）
+        # 形变正则化参数（ARAP + 体积保持 + AMAP）
         self.arap_weight = config["Training"]["spring_model"].get("arap_weight", 0.1)
         self.vol_weight = config["Training"]["spring_model"].get("vol_weight", 0.05)
+        self.amap_weight = config["Training"]["spring_model"].get("amap_weight", 0.0)
+        # 每个 spring model 的历史最大边长缓存（用于 AMAP 约束）
+        self.max_edge_lengths_cache = {}  # {frame_idx: [M, K] Tensor}
 
         # 自适应弹簧刚度参数（应变软化模型）
         self.adaptive_stiffness_enabled = config["Training"]["spring_model"].get(
@@ -321,7 +325,7 @@ class BackEnd(mp.Process):
         """
         if not self.spring_model_enabled:
             return torch.tensor(0.0, device=self.device)
-        if self.arap_weight <= 0 and self.vol_weight <= 0:
+        if self.arap_weight <= 0 and self.vol_weight <= 0 and self.amap_weight <= 0:
             return torch.tensor(0.0, device=self.device)
 
         from pytorch3d.ops import knn_points
@@ -363,6 +367,26 @@ class BackEnd(mp.Process):
                     current_anchors, ref_anchors, knn_index
                 )
                 total_loss = total_loss + self.vol_weight * vol
+
+            # AMAP：更新历史最大边长缓存，并驱动当前边长趋向历史最大值
+            # 防止软组织 SLAM 产生"表面收缩"退化解（见 NRSfM AMAP 约束）
+            if self.amap_weight > 0:
+                with torch.no_grad():
+                    anc_det = current_anchors.detach()
+                    det_j = anc_det[knn_index]                               # [M, K, 3]
+                    cur_len_det = torch.norm(det_j - anc_det.unsqueeze(1), dim=2)  # [M, K]
+                    if frame_idx in self.max_edge_lengths_cache:
+                        self.max_edge_lengths_cache[frame_idx] = torch.max(
+                            self.max_edge_lengths_cache[frame_idx], cur_len_det
+                        )
+                    else:
+                        self.max_edge_lengths_cache[frame_idx] = cur_len_det.clone()
+                amap = compute_amap_loss(
+                    current_anchors,
+                    knn_index,
+                    self.max_edge_lengths_cache[frame_idx],
+                )
+                total_loss = total_loss + self.amap_weight * amap
 
             count += 1
 

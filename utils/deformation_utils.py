@@ -129,7 +129,46 @@ def compute_deformation_energy(current_positions, reference_positions, knn_index
 
 
 # ---------------------------------------------------------------------------
-# 4. 自适应弹簧刚度（应变软化模型）
+# 4. AMAP（As-Maximal-As-Possible）形变约束损失
+# ---------------------------------------------------------------------------
+
+def compute_amap_loss(current_positions, knn_index, max_edge_lengths):
+    """AMAP（As-Maximal-As-Possible）形变约束损失（可微分）。
+
+    基于 GuoAnn 等人在 Learning-based Isometric NRSfM（ECCV 2024）中提出的
+    AMAP 启发式约束：
+
+    对于等距形变，拉伸上界是测地距离（不可延伸性约束），因此松弛后的最优解
+    趋于逼近可行域边界。AMAP 损失将当前帧每条弹簧边的长度向**历史观测最大
+    边长**驱动，显式抑制"表面收缩"退化解——这是内镜 SLAM 场景中弹簧点云
+    收敛过快时的常见退化模式。
+
+    能量形式（与 ARAP 互补，两者协同约束形变）：
+        L_AMAP = mean_{i,j} ( ||z_j' - z_i'|| - max_k ||z_j^k - z_i^k|| )^2
+
+    其中 max_k 是训练过程中观测到的历史最大边长（已 detach，不参与梯度）。
+
+    与 ARAP 的区别：
+    - ARAP：惩罚任何边长变化（保刚性）
+    - AMAP：驱动边长趋向历史最大值（防收缩）
+
+    Args:
+        current_positions: [M, 3] Tensor, 当前帧锚点位置（在优化器计算图中）
+        knn_index:         [M, K] long Tensor, 每个锚点的K个最近邻索引
+        max_edge_lengths:  [M, K] Tensor, 历史最大边长（已 detach，不参与梯度）
+
+    Returns:
+        scalar Tensor: AMAP 均方损失
+    """
+    M, K = knn_index.shape
+    cur_j = current_positions[knn_index]                              # [M, K, 3]
+    cur_len = torch.norm(cur_j - current_positions.unsqueeze(1), dim=2)  # [M, K]
+    # max_edge_lengths 已 detach，梯度只流向 current_positions
+    return ((cur_len - max_edge_lengths) ** 2).mean()
+
+
+# ---------------------------------------------------------------------------
+# 5. 自适应弹簧刚度（应变软化模型）
 # ---------------------------------------------------------------------------
 
 def compute_adaptive_stiffness(

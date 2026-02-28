@@ -56,6 +56,13 @@ Training:
     dt: 0.01
     n_iterations: 10
     visualize: True
+    # 形变正则化（ARAP + 体积保持 + AMAP）
+    arap_weight: 0.1         # ARAP 边长应变损失权重
+    vol_weight: 0.05         # 体积保持损失权重
+    amap_weight: 0.05        # AMAP 防收缩约束损失权重（NRSfM AMAP 启发式）
+    # 自适应弹簧刚度（应变软化模型）
+    adaptive_stiffness: True # 是否启用自适应刚度
+    strain_threshold: 0.1    # 应变软化阈值（10% 应变时开始显著软化）
 
 opt_params:
   iterations: 30000
