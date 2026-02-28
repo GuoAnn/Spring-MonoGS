@@ -1,15 +1,18 @@
 """体内可形变SLAM的形变约束工具模块。
 
-本模块实现了四种面向软组织形变建模的物理约束，设计原则：
-- ARAP / 体积保持损失完全可微分，可直接加入高斯点优化的损失函数
-- 自适应刚度与形变势能计算运行在 torch.no_grad() 上下文中，无副作用
+本模块实现了面向软组织形变建模的物理约束，设计原则：
+- ARAP / AMAP / 体积保持 / 法向一致性损失完全可微分，可直接加入高斯点优化的损失函数
+- 自适应刚度、形变势能、自适应损失权重运行在 torch.no_grad() 上下文中，无副作用
 - 所有函数只依赖 torch，无额外第三方依赖
 
 参考文献：
   [1] Sumner et al., "Embedded deformation for shape manipulation", SIGGRAPH 2007
   [2] Sorkine & Alexa, "As-rigid-as-possible surface modeling", SGP 2007
   [3] Holzapfel, "Nonlinear solid mechanics", Wiley 2000
+  [4] GuoAnn et al., "Learning-based Isometric NRSfM", ECCV 2024
 """
+
+import math
 
 import torch
 
@@ -44,13 +47,11 @@ def compute_arap_loss(current_positions, reference_positions, knn_index):
     """
     M, K = knn_index.shape
 
-    ref_i = reference_positions.unsqueeze(1).expand(M, K, 3)   # [M, K, 3]
-    ref_j = reference_positions[knn_index]                      # [M, K, 3]
-    ref_len = torch.norm(ref_j - ref_i, dim=2).clamp(min=1e-6)  # [M, K]
+    ref_j = reference_positions[knn_index]                                   # [M, K, 3]
+    ref_len = torch.norm(ref_j - reference_positions.unsqueeze(1), dim=2).clamp(min=1e-6)  # [M, K]
 
-    cur_i = current_positions.unsqueeze(1).expand(M, K, 3)      # [M, K, 3]
-    cur_j = current_positions[knn_index]                        # [M, K, 3]
-    cur_len = torch.norm(cur_j - cur_i, dim=2)                  # [M, K]
+    cur_j = current_positions[knn_index]                                     # [M, K, 3]
+    cur_len = torch.norm(cur_j - current_positions.unsqueeze(1), dim=2)      # [M, K]
 
     strain = (cur_len - ref_len) / ref_len                      # [M, K]
     return (strain ** 2).mean()
@@ -168,7 +169,98 @@ def compute_amap_loss(current_positions, knn_index, max_edge_lengths):
 
 
 # ---------------------------------------------------------------------------
-# 5. 自适应弹簧刚度（应变软化模型）
+# 5. 自适应损失权重 ω_l（NRSfM 论文公式(10)）
+# ---------------------------------------------------------------------------
+
+def compute_adaptive_loss_weight(n_points, c1=100, c2=300):
+    """基于稀疏点数量计算自适应形变损失权重 ω_l（纯标量函数，非可微）。
+
+    来源：GuoAnn et al., "Learning-based Isometric NRSfM", ECCV 2024, Eq.(10)。
+
+    物理意义：形变约束的可靠性依赖于点云密度：
+    - 点数极少（< c1）：覆盖不足，约束噪声大 → 降低权重
+    - 点数适中（c1 ~ c2）：约束可靠性正常 → 权重 = 1
+    - 点数充足（>= c2）：覆盖充分，约束更可信 → 权重 > 1（最大约 3）
+
+    注：本函数输入为整数 n_points，返回 Python float，作为损失函数的
+    无梯度乘法系数使用，不需要对 n_points 可微。
+
+    公式：
+        ω_l = (N_p / c1)^2           if N_p < c1
+            = 1                        if c1 ≤ N_p < c2
+            = 3 - 2*exp(-(N_p-c2)/c1) if N_p ≥ c2
+
+    Args:
+        n_points: int，当前锚点（或高斯点）数量
+        c1: int, 点数下阈值（默认 100）
+        c2: int, 点数上阈值（默认 300）
+
+    Returns:
+        float: 无量纲自适应权重
+    """
+    if n_points < c1:
+        return (n_points / c1) ** 2
+    elif n_points < c2:
+        return 1.0
+    else:
+        return 3.0 - 2.0 * math.exp(-(n_points - c2) / c1)
+
+
+# ---------------------------------------------------------------------------
+# 6. 表面法向一致性损失（局部 PCA 法向场平滑）
+# ---------------------------------------------------------------------------
+
+def compute_normal_consistency_loss(current_positions, knn_index):
+    """表面法向一致性正则化损失（可微分）。
+
+    原理：
+    将形变表面建模为黎曼流形。局部法向量通过对 K 近邻点云做 PCA 估计，
+    对应 NRSfM 论文中度量张量不变性的离散近似：
+    - 度量张量不变 ⟺ 局部曲面形状（含法向）在等距形变下不变
+    - 对稀疏点云，局部 PCA 法向是可微分、无参数的曲面法向估计器
+    相邻锚点之间的法向夹角惩罚即为**离散第一基本形式一致性约束**。
+
+    能量形式：
+        L_normal = mean_{i,j∈N(i)} ( 1 - (n_i · n_j)^2 )
+
+    其中 (·)^2 对法向符号歧义具有鲁棒性（n 与 -n 等价）。
+
+    关键性质：
+    - 完全可微分（通过 torch.linalg.eigh 对 current_positions 求梯度）
+    - 无需任何预计算或外部法向标注
+    - 与 ARAP/AMAP 互补：ARAP 约束边长，本损失约束法向，共同覆盖
+      第零阶（位置）和第一阶（曲率/法向）几何信息
+
+    Args:
+        current_positions: [M, 3] Tensor, 当前帧锚点位置（在优化器计算图中）
+        knn_index:         [M, K] long Tensor, K 近邻索引
+
+    Returns:
+        scalar Tensor: 法向一致性均方损失（0 = 完全一致）
+    """
+    M, K = knn_index.shape
+
+    # 近邻坐标，以锚点为原点做中心化
+    neighbors = current_positions[knn_index]                 # [M, K, 3]
+    centered = neighbors - current_positions.unsqueeze(1)    # [M, K, 3]
+
+    # 局部协方差矩阵（[M, 3, 3]），最小特征向量 = 法向量
+    cov = torch.bmm(centered.transpose(1, 2), centered) / K  # [M, 3, 3]
+
+    # torch.linalg.eigh 对实对称矩阵稳定、可微
+    # 特征值升序排列，第 0 列对应最小特征值（法向方向）
+    _, eigvecs = torch.linalg.eigh(cov)  # [M, 3], [M, 3, 3]
+    normals = torch.nn.functional.normalize(eigvecs[:, :, 0], dim=1)  # [M, 3]
+
+    # 邻域法向与中心法向的余弦平方（符号无关）
+    neighbor_normals = normals[knn_index]                              # [M, K, 3]
+    cos2 = (normals.unsqueeze(1) * neighbor_normals).sum(dim=2) ** 2  # [M, K]
+
+    return (1.0 - cos2).mean()
+
+
+# ---------------------------------------------------------------------------
+# 7. 自适应弹簧刚度（应变软化模型）
 # ---------------------------------------------------------------------------
 
 def compute_adaptive_stiffness(

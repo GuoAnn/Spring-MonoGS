@@ -19,6 +19,8 @@ from utils.deformation_utils import (
     compute_deformation_energy,
     compute_adaptive_stiffness,
     compute_amap_loss,
+    compute_adaptive_loss_weight,
+    compute_normal_consistency_loss,
 )
 
 
@@ -66,10 +68,11 @@ class BackEnd(mp.Process):
         self.dt = config["Training"]["spring_model"].get("dt", 0.01)  # 时间步长
         self.n_iterations = config["Training"]["spring_model"].get("n_iterations", 10)  # 迭代次数
 
-        # 形变正则化参数（ARAP + 体积保持 + AMAP）
+        # 形变正则化参数（ARAP + 体积保持 + AMAP + 法向一致性）
         self.arap_weight = config["Training"]["spring_model"].get("arap_weight", 0.1)
         self.vol_weight = config["Training"]["spring_model"].get("vol_weight", 0.05)
         self.amap_weight = config["Training"]["spring_model"].get("amap_weight", 0.0)
+        self.normal_weight = config["Training"]["spring_model"].get("normal_weight", 0.0)
         # 每个 spring model 的历史最大边长缓存（用于 AMAP 约束）
         self.max_edge_lengths_cache = {}  # {frame_idx: [M, K] Tensor}
 
@@ -305,17 +308,15 @@ class BackEnd(mp.Process):
             Log(f"Spring model error: {e}")
 
     def _compute_deformation_reg_loss(self, current_window):
-        """计算可微分的ARAP形变正则化损失和体积保持损失。
+        """计算可微分的形变正则化损失（ARAP + 体积保持 + AMAP + 法向一致性）。
 
-        原理：
-        使用当前高斯点位置（在优化器计算图中）作为各锚点的代理坐标，
-        计算ARAP应变损失和体积保持损失，为高斯点位置优化提供物理约束梯度。
-
-        与弹簧物理模拟的区别：
-        - 弹簧模拟：显式更新 _xyz.data，不产生梯度
-        - 本方法：产生梯度，引导光度优化朝向物理上合理的形变方向
-
-        两者协同工作，共同约束高斯点的形变行为。
+        设计原则：
+        - ARAP：约束边长应变（第零阶位置一致性）
+        - 体积保持：约束邻域回转半径（不可压缩性）
+        - AMAP：驱动边长趋向历史最大值，防止"表面收缩"退化（NRSfM paper eq.(3)）
+        - 法向一致性：通过局部 PCA 法向场估计，惩罚相邻法向偏差（NRSfM paper
+          度量张量不变性的离散近似）
+        - 自适应权重 ω_l：根据锚点数量缩放整体形变损失（NRSfM paper eq.(10)）
 
         Args:
             current_window: list[int], 当前关键帧窗口的帧索引列表
@@ -325,7 +326,8 @@ class BackEnd(mp.Process):
         """
         if not self.spring_model_enabled:
             return torch.tensor(0.0, device=self.device)
-        if self.arap_weight <= 0 and self.vol_weight <= 0 and self.amap_weight <= 0:
+        if (self.arap_weight <= 0 and self.vol_weight <= 0
+                and self.amap_weight <= 0 and self.normal_weight <= 0):
             return torch.tensor(0.0, device=self.device)
 
         from pytorch3d.ops import knn_points
@@ -358,15 +360,18 @@ class BackEnd(mp.Process):
             # 当前锚点位置（可微分：梯度通过 gaussian_xyz[idx_map] 流向 _xyz）
             current_anchors = gaussian_xyz[idx_map]  # [M, 3]
 
+            # NRSfM eq.(10): 自适应权重 ω_l（依据锚点数量缩放形变损失）
+            omega_l = compute_adaptive_loss_weight(M)
+
             if self.arap_weight > 0:
                 arap = compute_arap_loss(current_anchors, ref_anchors, knn_index)
-                total_loss = total_loss + self.arap_weight * arap
+                total_loss = total_loss + omega_l * self.arap_weight * arap
 
             if self.vol_weight > 0:
                 vol = compute_volume_preservation_loss(
                     current_anchors, ref_anchors, knn_index
                 )
-                total_loss = total_loss + self.vol_weight * vol
+                total_loss = total_loss + omega_l * self.vol_weight * vol
 
             # AMAP：更新历史最大边长缓存，并驱动当前边长趋向历史最大值
             # 防止软组织 SLAM 产生"表面收缩"退化解（见 NRSfM AMAP 约束）
@@ -386,7 +391,15 @@ class BackEnd(mp.Process):
                     knn_index,
                     self.max_edge_lengths_cache[frame_idx],
                 )
-                total_loss = total_loss + self.amap_weight * amap
+                total_loss = total_loss + omega_l * self.amap_weight * amap
+
+            # 法向一致性：局部 PCA 法向场平滑
+            # 对应 NRSfM 度量张量不变性的离散近似（第一阶微分几何约束）
+            # 要求 M >= 4：PCA 需要至少 3 个近邻点（K=8 时锚点数最低限制）
+            # 以保证 3×3 协方差矩阵的特征分解在数值上是非奇异的
+            if self.normal_weight > 0 and M >= 4:
+                normal = compute_normal_consistency_loss(current_anchors, knn_index)
+                total_loss = total_loss + omega_l * self.normal_weight * normal
 
             count += 1
 
