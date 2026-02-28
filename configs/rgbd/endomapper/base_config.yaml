@@ -59,6 +59,12 @@ Training:
     dt: 0.01         # 时间步长
     n_iterations: 10 # 优化迭代次数
     visualize: True  # 是否可视化锚点和弹簧连接
+    # 形变正则化（ARAP + 体积保持）
+    arap_weight: 0.1         # ARAP 边长应变损失权重
+    vol_weight: 0.05         # 体积保持损失权重
+    # 自适应弹簧刚度（应变软化模型）
+    adaptive_stiffness: True # 是否启用自适应刚度
+    strain_threshold: 0.1    # 应变软化阈值（10% 应变时开始显著软化）
 
 ## 3DGS default parameters
 opt_params:
