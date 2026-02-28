@@ -57,7 +57,7 @@ class BackEnd(mp.Process):
         self.spring_k = config["Training"]["spring_model"].get("spring_k", 0.1)  # 弹性系数
         self.damping = config["Training"]["spring_model"].get("damping", 0.01)  # 阻尼系数
         self.dt = config["Training"]["spring_model"].get("dt", 0.01)  # 时间步长
-        self.n_iters = config["Training"]["spring_model"].get("n_iterations", 10)  # 迭代次数
+        self.n_iterations = config["Training"]["spring_model"].get("n_iterations", 10)  # 迭代次数
 
         self.warned_frames = set()
         self.mapping_error_logged = set()
@@ -186,86 +186,104 @@ class BackEnd(mp.Process):
 
 
     def optimize_spring_model(self, current_window):
-        """优化弹簧模型参数和锚点位置"""
+        """使用弹簧模型约束锚点形变的空间一致性，减小形变误差。
+
+        算法步骤：
+        1. 从当前高斯点云中读取每个锚点的最新位置（KNN查找最近高斯点）。
+        2. 运行 SpringModel.step() —— 基于胡克定律的相邻锚点弹簧物理，
+           使形变在局部邻域内保持平滑一致（空间相关性约束）。
+        3. 将锚点形变量通过IDW插值传播到全体高斯点的几何位置（仅位置，
+           不影响外观属性，外观由光度优化器负责）。
+        """
         try:
             if not self.spring_model_enabled:
                 return
-            
-            if len(current_window) < 2:
+
+            gaussian_xyz = self.gaussians.get_xyz
+            if gaussian_xyz is None or gaussian_xyz.numel() == 0:
                 return
-            
-            # 获取模板帧（第一帧）的锚点
-            template_idx = current_window[0]
-            if self.template_anchors is None and template_idx in self.anchor_points:
-                self.template_anchors = self.anchor_points[template_idx]
-                Log(f"Set template anchors from frame {template_idx}")
-            
-            if self.template_anchors is None:
-                Log("Warning: No template anchors available")
-                return
-            
-            # 对每个非模板帧进行优化
-            for frame_idx in current_window[1:]:
-                if frame_idx not in self.anchor_points:
+
+            gaussian_xyz_detached = gaussian_xyz.detach()
+
+            from pytorch3d.ops import knn_points
+
+            for frame_idx in current_window:
+                spring_model = self.spring_models.get(frame_idx)
+                if spring_model is None:
                     continue
-                
-                # 获取当前帧的锚点
-                current_anchors = self.anchor_points[frame_idx]
-                if current_anchors is None:
-                    Log(f"Warning: anchor_points for frame {frame_idx} is None, skip spring optimization.")
+
+                # 弹簧模型创建时的锚点初始位置（参考构型）
+                original_anchors = spring_model.anchor_points  # [M, 3]
+                M = original_anchors.shape[0]
+                if M < 2:
                     continue
-                
-                # 初始化或获取速度
-                if frame_idx not in self.anchor_velocities:
-                    self.anchor_velocities[frame_idx] = torch.zeros_like(current_anchors)
-                
-                # 计算形变能量和物理约束
-                for _ in range(self.n_iters):
-                    # 计算弹簧力
-                    delta_pos = current_anchors - self.template_anchors
-                    dist = torch.norm(delta_pos, dim=1, keepdim=True)
-                    force = -self.spring_k * delta_pos  # 弹簧力
-                    
-                    # 添加阻尼力
-                    velocity = self.anchor_velocities[frame_idx]
-                    damping_force = -self.damping * velocity
-                    
-                    # 合力
-                    total_force = force + damping_force
-                    
-                    # 更新速度和位置
-                    self.anchor_velocities[frame_idx] = velocity + total_force * self.dt
-                    current_anchors = current_anchors + self.anchor_velocities[frame_idx] * self.dt
-                
-                # 更新锚点位置
-                self.anchor_points[frame_idx] = current_anchors
-                
-                # 使用锚点位置更新高斯点（每个关键帧只更新一次）
-                if self.gaussians.get_xyz is not None:
-                    gaussian_points = self.gaussians.get_xyz
-                    if gaussian_points.numel() > 0:
-                        # 注释掉后端的interpolate_gaussians函数（只保留前端采样）
-                        # updated_positions = self.interpolate_gaussians(
-                        #     current_anchors,
-                        #     gaussian_points,
-                        #     current_anchors - self.template_anchors,
-                        #     self.gaussians._features_dc[current_anchors],
-                        #     self.gaussians._features_rest[current_anchors],
-                        #     self.gaussians._opacity[current_anchors],
-                        #     "idw"
-                        # )
-                        # 检查插值结果有效性
-                        # if torch.isnan(updated_positions).any() or torch.isinf(updated_positions).any():
-                        #     Log("Warning: Invalid positions detected, skipping gaussian update for this frame.")
-                        #     continue
-                        # self.gaussians._xyz.data.copy_(updated_positions)
-                        if not hasattr(self, '_updated_frame_' + str(frame_idx)):
-                            setattr(self, '_updated_frame_' + str(frame_idx), True)
-                            Log(f"Updated gaussian points for frame {frame_idx}")
+
+                # 从当前高斯点云中找到每个锚点最近的高斯点，以获取锚点的实时位置。
+                # 这样使弹簧模型能够感知光度优化后高斯点的移动。
+                _, idx, _ = knn_points(
+                    original_anchors.unsqueeze(0),
+                    gaussian_xyz_detached.unsqueeze(0),
+                    K=1,
+                )
+                idx = idx.squeeze(0).squeeze(-1).long()  # [M]
+                current_anchors = gaussian_xyz_detached[idx].clone()  # [M, 3]
+
+                # 运行弹簧物理模拟（胡克定律 + 阻尼）：
+                # 相邻锚点之间的弹簧力使形变保持空间一致性。
+                # 每次调用使用零速度初始值，避免跨帧速度状态污染。
+                velocity = torch.zeros_like(current_anchors)
+                for _ in range(self.n_iterations):
+                    current_anchors, velocity = spring_model.step(
+                        current_anchors, velocity, self.dt
+                    )
+
+                # 计算锚点相对于初始位置的形变量
+                anchor_deltas = current_anchors - original_anchors
+
+                # 将弹簧平滑后的形变量通过IDW插值传播到全体高斯点（仅更新位置）
+                if anchor_deltas.abs().max().item() > 1e-8:
+                    self._apply_anchor_deformation_to_gaussians(
+                        original_anchors, gaussian_xyz_detached, anchor_deltas
+                    )
 
         except Exception as e:
             Log(f"Spring model error: {e}")
-            # 不提前return，保证主流程继续
+
+    def _apply_anchor_deformation_to_gaussians(
+        self, anchor_points, gaussian_points, anchor_deltas
+    ):
+        """将锚点形变量通过逆距离加权（IDW）插值传播到全体高斯点的几何位置。
+
+        只更新位置（_xyz），不修改外观属性（颜色、不透明度、尺度、旋转），
+        因为弹簧模型仅约束几何形变，外观属性由光度优化器负责更新。
+        """
+        from pytorch3d.ops import knn_points
+
+        K_BINDING = min(16, anchor_points.shape[0])
+        dist, idx, _ = knn_points(
+            gaussian_points.unsqueeze(0),
+            anchor_points.unsqueeze(0),
+            K=K_BINDING,
+        )
+        dist = dist.squeeze(0)   # [N, K]
+        idx = idx.squeeze(0).long()  # [N, K]
+
+        dist = torch.clamp(dist, min=1e-6)
+        eps = 1e-14
+        weights = 1.0 / (dist.sqrt() + eps)       # [N, K]
+        weights = weights / (weights.sum(dim=1, keepdim=True) + eps)  # 归一化
+
+        # IDW：每个高斯点的位移 = 最近 K 个锚点形变量的加权平均
+        anchor_deltas_knn = anchor_deltas[idx]                          # [N, K, 3]
+        delta_gaussians = (anchor_deltas_knn * weights.unsqueeze(-1)).sum(dim=1)  # [N, 3]
+        new_xyz = gaussian_points + delta_gaussians
+
+        if torch.isnan(new_xyz).any() or torch.isinf(new_xyz).any():
+            Log("Warning: Invalid positions from spring deformation, skipping update.")
+            return
+
+        with torch.no_grad():
+            self.gaussians._xyz.data.copy_(new_xyz)
 
     def interpolate_gaussians(self, anchor_points, gaussian_points, anchor_deltas, 
                               anchor_features_dc=None, anchor_features_rest=None, anchor_opacity=None, mode="idw"):
@@ -307,8 +325,7 @@ class BackEnd(mp.Process):
         new_attrs['features_dc'] = new_features_dc
         new_attrs['features_rest'] = new_features_rest
 
-        # 3. 不透明度
-        new_opacity = (new_opacity * weights.unsqueeze(-1)).sum(dim=1)
+        # 3. 不透明度（已在上方IDW分支中计算完毕，无需重复加权）
         new_attrs['opacity'] = new_opacity
 
         # 4. 尺度
