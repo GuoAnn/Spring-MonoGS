@@ -50,7 +50,15 @@ Training:
     cam_rot_delta: 0.003
     cam_trans_delta: 0.001
 
-
+  spring_model:
+    enabled: False
+    n_anchors: 1000
+    k_neighbors: 8
+    spring_k: 0.1
+    damping: 0.01
+    dt: 0.01
+    n_iterations: 10
+    visualize: False
 
 ## 3DGS default parameters
 opt_params:

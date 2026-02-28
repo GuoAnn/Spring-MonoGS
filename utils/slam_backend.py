@@ -13,6 +13,15 @@ from utils.multiprocessing_utils import clone_obj
 from utils.pose_utils import update_pose
 from utils.slam_utils import get_loss_mapping
 from utils.gaussian_interpolation import interpolate_gaussian
+from utils.deformation_utils import (
+    compute_arap_loss,
+    compute_volume_preservation_loss,
+    compute_deformation_energy,
+    compute_adaptive_stiffness,
+    compute_amap_loss,
+    compute_adaptive_loss_weight,
+    compute_normal_consistency_loss,
+)
 
 
 class BackEnd(mp.Process):
@@ -57,7 +66,23 @@ class BackEnd(mp.Process):
         self.spring_k = config["Training"]["spring_model"].get("spring_k", 0.1)  # 弹性系数
         self.damping = config["Training"]["spring_model"].get("damping", 0.01)  # 阻尼系数
         self.dt = config["Training"]["spring_model"].get("dt", 0.01)  # 时间步长
-        self.n_iters = config["Training"]["spring_model"].get("n_iters", 10)  # 迭代次数
+        self.n_iterations = config["Training"]["spring_model"].get("n_iterations", 10)  # 迭代次数
+
+        # 形变正则化参数（ARAP + 体积保持 + AMAP + 法向一致性）
+        self.arap_weight = config["Training"]["spring_model"].get("arap_weight", 0.1)
+        self.vol_weight = config["Training"]["spring_model"].get("vol_weight", 0.05)
+        self.amap_weight = config["Training"]["spring_model"].get("amap_weight", 0.0)
+        self.normal_weight = config["Training"]["spring_model"].get("normal_weight", 0.0)
+        # 每个 spring model 的历史最大边长缓存（用于 AMAP 约束）
+        self.max_edge_lengths_cache = {}  # {frame_idx: [M, K] Tensor}
+
+        # 自适应弹簧刚度参数（应变软化模型）
+        self.adaptive_stiffness_enabled = config["Training"]["spring_model"].get(
+            "adaptive_stiffness", True
+        )
+        self.strain_threshold = config["Training"]["spring_model"].get(
+            "strain_threshold", 0.1
+        )
 
         self.warned_frames = set()
         self.mapping_error_logged = set()
@@ -186,86 +211,238 @@ class BackEnd(mp.Process):
 
 
     def optimize_spring_model(self, current_window):
-        """优化弹簧模型参数和锚点位置"""
+        """使用弹簧模型约束锚点形变的空间一致性，减小形变误差。
+
+        算法步骤：
+        1. 从当前高斯点云中读取每个锚点的最新位置（KNN查找最近高斯点）。
+        2. 基于当前应变计算自适应弹簧刚度（应变软化：大形变时刚度降低，
+           模拟软组织的非线性力学特性）。
+        3. 运行 SpringModel.step() —— 基于胡克定律的相邻锚点弹簧物理，
+           使形变在局部邻域内保持平滑一致（空间相关性约束）。
+        4. 将锚点形变量通过IDW插值传播到全体高斯点的几何位置（仅位置，
+           不影响外观属性，外观由光度优化器负责）。
+        """
         try:
             if not self.spring_model_enabled:
                 return
-            
-            if len(current_window) < 2:
+
+            gaussian_xyz = self.gaussians.get_xyz
+            if gaussian_xyz is None or gaussian_xyz.numel() == 0:
                 return
-            
-            # 获取模板帧（第一帧）的锚点
-            template_idx = current_window[0]
-            if self.template_anchors is None and template_idx in self.anchor_points:
-                self.template_anchors = self.anchor_points[template_idx]
-                Log(f"Set template anchors from frame {template_idx}")
-            
-            if self.template_anchors is None:
-                Log("Warning: No template anchors available")
-                return
-            
-            # 对每个非模板帧进行优化
-            for frame_idx in current_window[1:]:
-                if frame_idx not in self.anchor_points:
+
+            gaussian_xyz_detached = gaussian_xyz.detach()
+
+            from pytorch3d.ops import knn_points
+
+            total_energy = 0.0
+            n_models = 0
+
+            for frame_idx in current_window:
+                spring_model = self.spring_models.get(frame_idx)
+                if spring_model is None:
                     continue
-                
-                # 获取当前帧的锚点
-                current_anchors = self.anchor_points[frame_idx]
-                if current_anchors is None:
-                    Log(f"Warning: anchor_points for frame {frame_idx} is None, skip spring optimization.")
+
+                # 弹簧模型创建时的锚点初始位置（参考构型）
+                original_anchors = spring_model.anchor_points  # [M, 3]
+                M = original_anchors.shape[0]
+                if M < 2:
                     continue
-                
-                # 初始化或获取速度
-                if frame_idx not in self.anchor_velocities:
-                    self.anchor_velocities[frame_idx] = torch.zeros_like(current_anchors)
-                
-                # 计算形变能量和物理约束
-                for _ in range(self.n_iters):
-                    # 计算弹簧力
-                    delta_pos = current_anchors - self.template_anchors
-                    dist = torch.norm(delta_pos, dim=1, keepdim=True)
-                    force = -self.spring_k * delta_pos  # 弹簧力
-                    
-                    # 添加阻尼力
-                    velocity = self.anchor_velocities[frame_idx]
-                    damping_force = -self.damping * velocity
-                    
-                    # 合力
-                    total_force = force + damping_force
-                    
-                    # 更新速度和位置
-                    self.anchor_velocities[frame_idx] = velocity + total_force * self.dt
-                    current_anchors = current_anchors + self.anchor_velocities[frame_idx] * self.dt
-                
-                # 更新锚点位置
-                self.anchor_points[frame_idx] = current_anchors
-                
-                # 使用锚点位置更新高斯点（每个关键帧只更新一次）
-                if self.gaussians.get_xyz is not None:
-                    gaussian_points = self.gaussians.get_xyz
-                    if gaussian_points.numel() > 0:
-                        # 注释掉后端的interpolate_gaussians函数（只保留前端采样）
-                        # updated_positions = self.interpolate_gaussians(
-                        #     current_anchors,
-                        #     gaussian_points,
-                        #     current_anchors - self.template_anchors,
-                        #     self.gaussians._features_dc[current_anchors],
-                        #     self.gaussians._features_rest[current_anchors],
-                        #     self.gaussians._opacity[current_anchors],
-                        #     "idw"
-                        # )
-                        # 检查插值结果有效性
-                        # if torch.isnan(updated_positions).any() or torch.isinf(updated_positions).any():
-                        #     Log("Warning: Invalid positions detected, skipping gaussian update for this frame.")
-                        #     continue
-                        # self.gaussians._xyz.data.copy_(updated_positions)
-                        if not hasattr(self, '_updated_frame_' + str(frame_idx)):
-                            setattr(self, '_updated_frame_' + str(frame_idx), True)
-                            Log(f"Updated gaussian points for frame {frame_idx}")
+
+                # 从当前高斯点云中找到每个锚点最近的高斯点，以获取锚点的实时位置。
+                # 这样使弹簧模型能够感知光度优化后高斯点的移动。
+                _, idx, _ = knn_points(
+                    original_anchors.unsqueeze(0),
+                    gaussian_xyz_detached.unsqueeze(0),
+                    K=1,
+                )
+                idx = idx.squeeze(0).squeeze(-1).long()  # [M]
+                current_anchors = gaussian_xyz_detached[idx].clone()  # [M, 3]
+
+                # 自适应刚度：基于当前应变，对大形变区域降低弹簧刚度（应变软化）。
+                # 每次迭代重新计算，不修改 spring_model 的基础参数。
+                original_k = spring_model.k.clone()
+                if self.adaptive_stiffness_enabled:
+                    spring_model.k = compute_adaptive_stiffness(
+                        current_anchors,
+                        original_anchors,
+                        spring_model.knn_index,
+                        original_k,
+                        strain_threshold=self.strain_threshold,
+                    )
+
+                # 运行弹簧物理模拟（胡克定律 + 阻尼）：
+                # 相邻锚点之间的弹簧力使形变保持空间一致性。
+                # 每次调用使用零速度初始值，避免跨帧速度状态污染。
+                velocity = torch.zeros_like(current_anchors)
+                for _ in range(self.n_iterations):
+                    current_anchors, velocity = spring_model.step(
+                        current_anchors, velocity, self.dt
+                    )
+
+                # 恢复基础刚度（自适应刚度仅在本次迭代有效）
+                spring_model.k = original_k
+
+                # 计算锚点相对于初始位置的形变量
+                anchor_deltas = current_anchors - original_anchors
+
+                # 记录形变势能（用于监控，不参与梯度计算）
+                total_energy += compute_deformation_energy(
+                    current_anchors,
+                    original_anchors,
+                    spring_model.knn_index,
+                    original_k,
+                )
+                n_models += 1
+
+                # 将弹簧平滑后的形变量通过IDW插值传播到全体高斯点（仅更新位置）
+                if anchor_deltas.abs().max().item() > 1e-8:
+                    self._apply_anchor_deformation_to_gaussians(
+                        original_anchors, gaussian_xyz_detached, anchor_deltas
+                    )
+
+            if n_models > 0 and self.iteration_count % 50 == 0:
+                avg_energy = total_energy / n_models
+                Log(f"[Deformation] mean spring energy: {avg_energy:.4f} over {n_models} frames")
 
         except Exception as e:
             Log(f"Spring model error: {e}")
-            # 不提前return，保证主流程继续
+
+    def _compute_deformation_reg_loss(self, current_window):
+        """计算可微分的形变正则化损失（ARAP + 体积保持 + AMAP + 法向一致性）。
+
+        设计原则：
+        - ARAP：约束边长应变（第零阶位置一致性）
+        - 体积保持：约束邻域回转半径（不可压缩性）
+        - AMAP：驱动边长趋向历史最大值，防止"表面收缩"退化（NRSfM paper eq.(3)）
+        - 法向一致性：通过局部 PCA 法向场估计，惩罚相邻法向偏差（NRSfM paper
+          度量张量不变性的离散近似）
+        - 自适应权重 ω_l：根据锚点数量缩放整体形变损失（NRSfM paper eq.(10)）
+
+        Args:
+            current_window: list[int], 当前关键帧窗口的帧索引列表
+
+        Returns:
+            scalar Tensor: 总形变正则化损失
+        """
+        if not self.spring_model_enabled:
+            return torch.tensor(0.0, device=self.device)
+        if (self.arap_weight <= 0 and self.vol_weight <= 0
+                and self.amap_weight <= 0 and self.normal_weight <= 0):
+            return torch.tensor(0.0, device=self.device)
+
+        from pytorch3d.ops import knn_points
+
+        gaussian_xyz = self.gaussians._xyz  # [N, 3], 在优化器计算图中
+        total_loss = torch.tensor(0.0, device=self.device)
+        count = 0
+
+        for frame_idx in current_window:
+            spring_model = self.spring_models.get(frame_idx)
+            if spring_model is None:
+                continue
+
+            ref_anchors = spring_model.anchor_points  # [M, 3], detached
+            knn_index = spring_model.knn_index        # [M, K], long
+            M = ref_anchors.shape[0]
+            if M < 2:
+                continue
+
+            # 非可微的KNN查找：找到每个参考锚点在当前高斯点云中的最近邻索引
+            # 索引本身不在计算图中，但通过索引查找得到的 current_anchors 仍可微
+            with torch.no_grad():
+                _, idx_map, _ = knn_points(
+                    ref_anchors.unsqueeze(0),
+                    gaussian_xyz.detach().unsqueeze(0),
+                    K=1,
+                )
+                idx_map = idx_map.squeeze(0).squeeze(-1).long()  # [M]
+
+            # 当前锚点位置（可微分：梯度通过 gaussian_xyz[idx_map] 流向 _xyz）
+            current_anchors = gaussian_xyz[idx_map]  # [M, 3]
+
+            # NRSfM eq.(10): 自适应权重 ω_l（依据锚点数量缩放形变损失）
+            omega_l = compute_adaptive_loss_weight(M)
+
+            if self.arap_weight > 0:
+                arap = compute_arap_loss(current_anchors, ref_anchors, knn_index)
+                total_loss = total_loss + omega_l * self.arap_weight * arap
+
+            if self.vol_weight > 0:
+                vol = compute_volume_preservation_loss(
+                    current_anchors, ref_anchors, knn_index
+                )
+                total_loss = total_loss + omega_l * self.vol_weight * vol
+
+            # AMAP：更新历史最大边长缓存，并驱动当前边长趋向历史最大值
+            # 防止软组织 SLAM 产生"表面收缩"退化解（见 NRSfM AMAP 约束）
+            if self.amap_weight > 0:
+                with torch.no_grad():
+                    anc_det = current_anchors.detach()
+                    det_j = anc_det[knn_index]                               # [M, K, 3]
+                    cur_len_det = torch.norm(det_j - anc_det.unsqueeze(1), dim=2)  # [M, K]
+                    if frame_idx in self.max_edge_lengths_cache:
+                        self.max_edge_lengths_cache[frame_idx] = torch.max(
+                            self.max_edge_lengths_cache[frame_idx], cur_len_det
+                        )
+                    else:
+                        self.max_edge_lengths_cache[frame_idx] = cur_len_det.clone()
+                amap = compute_amap_loss(
+                    current_anchors,
+                    knn_index,
+                    self.max_edge_lengths_cache[frame_idx],
+                )
+                total_loss = total_loss + omega_l * self.amap_weight * amap
+
+            # 法向一致性：局部 PCA 法向场平滑
+            # 对应 NRSfM 度量张量不变性的离散近似（第一阶微分几何约束）
+            # 要求 M >= 4：PCA 需要至少 3 个近邻点（K=8 时锚点数最低限制）
+            # 以保证 3×3 协方差矩阵的特征分解在数值上是非奇异的
+            if self.normal_weight > 0 and M >= 4:
+                normal = compute_normal_consistency_loss(current_anchors, knn_index)
+                total_loss = total_loss + omega_l * self.normal_weight * normal
+
+            count += 1
+
+        if count > 0:
+            total_loss = total_loss / count
+
+        return total_loss
+
+    def _apply_anchor_deformation_to_gaussians(
+        self, anchor_points, gaussian_points, anchor_deltas
+    ):
+        """将锚点形变量通过逆距离加权（IDW）插值传播到全体高斯点的几何位置。
+
+        只更新位置（_xyz），不修改外观属性（颜色、不透明度、尺度、旋转），
+        因为弹簧模型仅约束几何形变，外观属性由光度优化器负责更新。
+        """
+        from pytorch3d.ops import knn_points
+
+        K_BINDING = min(16, anchor_points.shape[0])
+        dist, idx, _ = knn_points(
+            gaussian_points.unsqueeze(0),
+            anchor_points.unsqueeze(0),
+            K=K_BINDING,
+        )
+        dist = dist.squeeze(0)   # [N, K]
+        idx = idx.squeeze(0).long()  # [N, K]
+
+        dist = torch.clamp(dist, min=1e-6)
+        eps = 1e-14
+        weights = 1.0 / (dist.sqrt() + eps)       # [N, K]
+        weights = weights / (weights.sum(dim=1, keepdim=True) + eps)  # 归一化
+
+        # IDW：每个高斯点的位移 = 最近 K 个锚点形变量的加权平均
+        anchor_deltas_knn = anchor_deltas[idx]                          # [N, K, 3]
+        delta_gaussians = (anchor_deltas_knn * weights.unsqueeze(-1)).sum(dim=1)  # [N, 3]
+        new_xyz = gaussian_points + delta_gaussians
+
+        if torch.isnan(new_xyz).any() or torch.isinf(new_xyz).any():
+            Log("Warning: Invalid positions from spring deformation, skipping update.")
+            return
+
+        with torch.no_grad():
+            self.gaussians._xyz.data.copy_(new_xyz)
 
     def interpolate_gaussians(self, anchor_points, gaussian_points, anchor_deltas, 
                               anchor_features_dc=None, anchor_features_rest=None, anchor_opacity=None, mode="idw"):
@@ -307,8 +484,7 @@ class BackEnd(mp.Process):
         new_attrs['features_dc'] = new_features_dc
         new_attrs['features_rest'] = new_features_rest
 
-        # 3. 不透明度
-        new_opacity = (new_opacity * weights.unsqueeze(-1)).sum(dim=1)
+        # 3. 不透明度（已在上方IDW分支中计算完毕，无需重复加权）
         new_attrs['opacity'] = new_opacity
 
         # 4. 尺度
@@ -474,6 +650,13 @@ class BackEnd(mp.Process):
                 scaling = self.gaussians.get_scaling
                 isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1))
                 loss_mapping += 10 * isotropic_loss.mean()
+
+                # ARAP 形变正则化 + 体积保持损失
+                # 为高斯点位置优化提供物理约束梯度，防止形变产生物理上不合理的结果
+                if self.spring_model_enabled:
+                    deform_reg = self._compute_deformation_reg_loss(current_window)
+                    loss_mapping += deform_reg
+
                 loss_mapping.backward()
                 gaussian_split = False
                 
