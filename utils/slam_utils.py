@@ -129,17 +129,6 @@ def get_loss_mapping_rgbd(config, image, depth, viewpoint, initialization=False)
 
     return alpha * l1_rgb.mean() + (1 - alpha) * l1_depth.mean()
 
-    gt_depth = torch.from_numpy(viewpoint.depth).to(
-        dtype=torch.float32, device=image.device
-    )[None]
-    rgb_pixel_mask = (gt_image.sum(dim=0) > rgb_boundary_threshold).view(*depth.shape)
-    depth_pixel_mask = (gt_depth > 0.01).view(*depth.shape)
-
-    l1_rgb = torch.abs(image * rgb_pixel_mask - gt_image * rgb_pixel_mask)
-    l1_depth = torch.abs(depth * depth_pixel_mask - gt_depth * depth_pixel_mask)
-
-    return alpha * l1_rgb.mean() + (1 - alpha) * l1_depth.mean()
-
 
 def get_median_depth(depth, opacity=None, mask=None, return_std=False):
     depth = depth.detach().clone()

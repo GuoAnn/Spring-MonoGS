@@ -57,7 +57,7 @@ class BackEnd(mp.Process):
         self.spring_k = config["Training"]["spring_model"].get("spring_k", 0.1)  # 弹性系数
         self.damping = config["Training"]["spring_model"].get("damping", 0.01)  # 阻尼系数
         self.dt = config["Training"]["spring_model"].get("dt", 0.01)  # 时间步长
-        self.n_iters = config["Training"]["spring_model"].get("n_iters", 10)  # 迭代次数
+        self.n_iters = config["Training"]["spring_model"].get("n_iterations", 10)  # 迭代次数
 
         self.warned_frames = set()
         self.mapping_error_logged = set()
